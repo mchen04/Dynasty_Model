@@ -1,0 +1,23 @@
+# Dynasty Model Specification Review
+
+A critical review of the `spec.md` document, highlighting methodology gaps, scaling issues, and fantasy meta-game blind spots.
+
+## 1. Mathematical Flaws in Stage 1 to Stage 2 Handoff
+
+*   **The "Future Baseline" Parallax:** In Stage 1, you predict **raw per-game stats** for Seasons T+1 through T+5. In Stage 2, you convert these to Z-Scores using `(player_projected_stat - pool_mean) / pool_std`. What is the `pool_mean` in 2028? The NBA average shifts constantly (as noted in the era-adjustment section). If you use 2024's pool mean to calculate 2028's Z-scores, your projections will drift. You either need to build a separate macro-model that forecasts the *league average stats* for T+1 to T+5, or you need to train Stage 1 to **output future Z-scores directly** instead of raw stats.
+*   **Trade Value Linearity (The "2-for-1" Problem):** Your Trade Value normalization is a simple linear map of VORP `(player_dynasty_VORP - min_VORP) / (max_VORP - min_VORP)`. In dynasty fantasy sports, trade math is **non-linear** because roster spots are finite. A player with 80 VORP is intrinsically worth *more* than two players with 40 VORP because consolidating value into one roster spot allows you to pick up a replacement-level player. You need a non-linear power curve to normalize trade value so users don't think three scrubs equal one Luka Dončić.
+
+## 2. Feature & Context Stationarity (The Model's Blindness)
+
+*   **The "Future Context" Leak:** Your feature set includes highly sensitive contextual features like `Coach`, `Team Pace`, `Teammate average BPM`, and `Minutes available`. This works well for predicting Season T using Season T-1 data. But how do you project Season T+3? You don't know who their coach will be, what team they will be on, or who their teammates will be. If you assume these features remain static from T=0, you are introducing massive compounding errors the further out your horizon goes. You must either drop team context features for long-term horizons, or implement a "decay to mean context" function.
+*   **Positional Eligibility Shifts:** The model assumes static positional definitions. Positional eligibility dictates replacement level, heavily driving value. In ESPN fantasy, a player loses multi-position eligibility (e.g., losing 'PG' status to just 'SG') if they don't play enough real NBA minutes at that position. A center who has PF eligibility is mathematically more valuable than a pure center. You aren't tracking or predicting positional fluidity.
+
+## 3. Fantasy Meta-Game Misses
+
+*   **Punting Dynamics in Category Leagues:** You are generating a *single* overall Z-score sum for standard 9-cat. In real high-level dynasty play, nobody plays a perfectly balanced 9-cat roster. The meta relies on "punting" (ignoring 1 or 2 categories to dominate the rest). A player like Giannis or Walker Kessler might have an overall ranking of #40 in a vacuum because of FT%, but to a team punting FT%, they are a top #5 asset. A single static valuation for 9-cat is an outdated paradigm; the model should optionally allow users to input a "punt vector."
+*   **The Schedule / Playoff Shutdown Risk:** Predicting `games_played` for a season treats a game in November exactly the same as a game in late March. In fantasy H2H, the fantasy playoffs (Weeks 20-23) are all that matter. Older stars on locked-in playoff teams, or good players on active tanking teams, are notorious for "silly season shutdowns." The model's valuation layer doesn't weight *when* the stats occur.
+
+## 4. Data Pipeline Risks
+
+*   **Survivorship Bias in the LSTM Strategy:** You noted filtering out players with `<200 minutes`. Be extremely careful here. If you only train your LSTM on sequences of players who played enough minutes to stay in your dataset, your model will never learn what a "bust" looks like early in their career. The LSTM will look at a struggling 21-year-old and map him to a historical player who struggled at 21 *but survived to 25*. It won't map him to a player who washed out of the league at 22, severely inflating prospects who are on bad arcs. Add explicit "bust trajectories" back into the data.
+*   **"Minutes Played" is Treated as an Output rather than a Driver:** You have Minutes as an *output* of Stage 1 (along with PTS, REB, AST). In reality, most counting stats scale linearly with minutes. If a coach plays a rookie 20 mpg versus 30 mpg, their per-game stats swing wildly. The model needs to separate *efficiency* projection from *opportunity* prediction. Predicting Per-36 or Per-100-Possession stats *first*, and then multiplying by a predicted Minutes share isolates these two wildly different signals.
