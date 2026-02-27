@@ -22,21 +22,27 @@ Both outputs are **dynasty-aware**: they weight long-term future production, not
 
 ---
 
-## Architecture: Two-Stage Pipeline
+## Architecture: Three-Stage Pipeline
 
-### Stage 1 — Stat Projection Model (League-Agnostic)
+### Stage 0 — Data Harmonization & Imputation
 
-Predicts per-game stat lines for each player across multiple future seasons.
+Handles missing positional data and advanced tracking stats for the pre-2014 era.
+- **Backcast Imputation Model**: Trains an auxiliary model exclusively on 2014–Present data predicting advanced metrics (RAPTOR, EPM, Tracking metrics like potential assists) from traditional play-by-play and box scores. 
+- Applies these predictions backwards to impute accurate spatial/impact data for players from 2001-2013, ensuring an unbroken long-term dataset for the temporal model.
+
+### Stage 1 — Probabilistic Stat Projection Model (League-Agnostic)
+
+Predicts **probabilistic distributions** of per-game stats across future seasons, yielding 10th (Floor), 50th (Median), and 90th (Ceiling) percentile outcomes.
 
 Crucially, **Stage 1 predicts Efficiency (per-100 possessions) and Opportunity (Minutes Share) separately.**
-Raw per-game stats are derived by multiplying these two predictions, preventing the model from confusing a highly efficient low-minute player with a low-efficiency high-minute player.
+Raw per-game stats are derived by multiplying these two predictions.
 
 - **Input**: player features (see Feature Set below)
-- **Output**: projected per-100 stats, projected minutes, and games played for seasons T+1 through T+5.
-- **Model**: ensemble of XGBoost (tabular features) + LSTM (career trajectory sequences)
-  - XGBoost handles the cross-sectional snapshot: "given everything we know about this player right now, what are his stats next year?"
-  - LSTM handles the longitudinal trajectory: "given this player's career arc so far, where is the trend going?"
-  - Final prediction = weighted blend of both, with SHAP values for interpretability
+- **Output**: Multi-quantile projected per-100 stats, minutes, and GP for seasons T+1 through T+5.
+- **Model**: Ensemble of Quantile Regression (e.g. NGBoost/LightGBM) + Time-Series Transformer
+  - The tree model handles the cross-sectional snapshot.
+  - The **Time-Series Transformer** elegantly processes a player's temporal career arc, using attention mechanisms to weigh specific developmental leaps and injury-shortened seasons simultaneously.
+  - Final prediction = probabilistic blend with ceiling/floor confidence intervals.
 - Trained once, shared across all league formats
 
 ### Stage 2 — Configurable Valuation Layer (League-Specific)
@@ -51,9 +57,10 @@ Converts projected stat lines into dollar/trade values based on league settings.
   4. Sum discounted values → total dynasty asset value
   5. Compute positional replacement level based on league size, roster slots, and positional fluidity.
   6. Calculate Value Over Replacement Player (VORP)
-  7. Convert VORP to auction dollars: `player_$ = (player_VORP / total_VORP_pool) × total_league_budget`
-  8. For trade value: normalize using a **non-linear power curve** to account for roster consolidation premiums (2-for-1 trades).
-- No ML training required — pure math, instantly recalculated for any league config
+  7. **Roster-Context Evaluation**: Recalculate VORP specifically for arbitrary team builds (Punt categories) by applying category weights. Yields two metrics: *Market Value* and *Roster Value*.
+  8. Convert VORP to auction dollars: `player_$ = (player_VORP / total_VORP_pool) × total_league_budget`
+  9. For trade value: normalize using a **non-linear power curve** to account for roster consolidation premiums (2-for-1 trades).
+- No ML training required — pure math, instantly recalculated for any league config based on owner's exact roster context.
 
 ---
 
@@ -135,13 +142,14 @@ Formula: `z_stat = (player_stat - season_mean) / season_std`
 - Team pace
 - **Note:** For multi-year forecasting (T+2 and beyond), these features are artificially decayed back towards the league average, as team context is highly volatile long-term.
 
-### G. Role & Opportunity
+### G. Role, Opportunity & Network Effects
 - Depth chart position
 - Minutes share: `player_minutes / team_total_minutes`
-- Usage rate
-- Passes per game, potential assists (tracking data)
+- Usage rate & Passer Rating (tracker data)
+- **Usage Vacuums (Network Effect)**: `team_vacated_usage` measuring how much total usage rate from the prior season's roster is leaving in free agency/trades, creating a "development vacuum" for remaining young players.
+- **Coaching Tags**: One-hot/Categorical embedding of the Head Coach and offensive system to boost/penalize pace and rotation tightness.
 
-### H. Historical Trajectory Features (LSTM Sequence Inputs)
+### H. Historical Trajectory Features (Transformer Sequence Inputs)
 For the LSTM component, feed a **sequence of season-level feature vectors** representing the player's entire career:
 - Per-season: all stats from groups A–G aggregated at the season level
 - Padded/masked for players with fewer seasons
@@ -174,13 +182,14 @@ Multiple Output Regression Strategy:
 
 ## Model Training Details
 
-### XGBoost Component
-- **Features**: all tabular features from groups A–I (flattened to a single vector per player-season)
-- **Hyperparameter tuning**: Bayesian optimization (Optuna) with 5-fold time-series cross-validation
+### Quantile Regression Component
+- **Architecture**: NGBoost, CatBoost, or LightGBM with quantile error functions.
+- **Features**: all tabular features from groups A–I.
+- **Hyperparameter tuning**: Bayesian optimization (Optuna) with 5-fold time-series cross-validation.
 
-### LSTM Component
-- **Architecture**: 2-layer bidirectional LSTM with attention
-- **Training Strategy**: Includes sequence masking padding to account for all career lengths, explicitly fed historical busts/wash-outs.
+### Time-Series Transformer Component
+- **Architecture**: Transformer encoder blocks (multi-head self-attention) adapted for tabular series.
+- **Training Strategy**: Uses positional encoding to gracefully handle missing/shortened injury seasons. Explicitly fed historical busts to prevent survivorship bias and train accurate 10th-percentile (floor) outcomes.
 
 ### Ensemble Blend
 - `final_prediction = α × xgb_prediction + (1 - α) × lstm_prediction`
