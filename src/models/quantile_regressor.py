@@ -1,5 +1,10 @@
+import json
+import os
+import pickle
+
 import numpy as np
 
+from src.models.serialization import ensure_dir
 from src.utils.config import load_config
 
 
@@ -133,6 +138,55 @@ class QuantileRegressorPool:
             "ceiling": self.models["ceiling"].predict(X_test),
         }
 
+    def save(self, directory):
+        """Save LightGBM boosters (.txt), MAPIE wrapper (.pkl), and params (.json)."""
+        ensure_dir(directory)
+        prefix = f"{self.target_name}_T+{self.horizon}"
+
+        for label, model in self.models.items():
+            path = os.path.join(directory, f"{prefix}_{label}.txt")
+            model.booster_.save_model(path)
+
+        if self.is_calibrated and "mapie" in self.calibrated_models:
+            mapie_path = os.path.join(directory, f"{prefix}_mapie.pkl")
+            with open(mapie_path, "wb") as f:
+                pickle.dump(self.calibrated_models["mapie"], f)
+
+        if self._best_params is not None:
+            params_path = os.path.join(directory, f"{prefix}_params.json")
+            with open(params_path, "w") as f:
+                json.dump(self._best_params, f, indent=2)
+
+    @classmethod
+    def load(cls, directory, target_name, horizon):
+        """Reconstruct a QuantileRegressorPool from saved files."""
+        import lightgbm as lgb
+
+        pool = cls(target_name=target_name, horizon=horizon)
+        prefix = f"{target_name}_T+{horizon}"
+
+        for label in ["floor", "median", "ceiling"]:
+            path = os.path.join(directory, f"{prefix}_{label}.txt")
+            if os.path.exists(path):
+                booster = lgb.Booster(model_file=path)
+                pool.models[label] = booster
+
+        if pool.models:
+            pool.is_trained = True
+
+        mapie_path = os.path.join(directory, f"{prefix}_mapie.pkl")
+        if os.path.exists(mapie_path):
+            with open(mapie_path, "rb") as f:
+                pool.calibrated_models["mapie"] = pickle.load(f)
+            pool.is_calibrated = True
+
+        params_path = os.path.join(directory, f"{prefix}_params.json")
+        if os.path.exists(params_path):
+            with open(params_path) as f:
+                pool._best_params = json.load(f)
+
+        return pool
+
 
 class MultiTargetQuantilePool:
     """
@@ -204,6 +258,27 @@ class MultiTargetQuantilePool:
             if pool.is_trained:
                 results[key] = pool.predict(X_test)
         return results
+
+    def save_all(self, base_directory):
+        """Save all trained pools to base_directory."""
+        ensure_dir(base_directory)
+        for key, pool in self.pools.items():
+            if pool.is_trained:
+                pool.save(base_directory)
+
+    @classmethod
+    def load_all(cls, base_directory, target_names=None, horizons=None):
+        """Reconstruct all pools from saved files."""
+        mt = cls(target_names=target_names, horizons=horizons)
+        for key, pool_placeholder in mt.pools.items():
+            loaded = QuantileRegressorPool.load(
+                base_directory,
+                pool_placeholder.target_name,
+                pool_placeholder.horizon,
+            )
+            if loaded.is_trained:
+                mt.pools[key] = loaded
+        return mt
 
 
 if __name__ == "__main__":

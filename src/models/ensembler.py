@@ -64,6 +64,27 @@ class Stage1Ensembler(nn.Module):
 
         return blended_sorted
 
+    def save(self, path):
+        """Save state_dict and constructor hyperparams."""
+        checkpoint = {
+            "state_dict": self.state_dict(),
+            "hparams": {
+                "num_stats": self.num_stats,
+                "embedding_dim": self.embedding_dim,
+            },
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load(cls, path, map_location="cpu"):
+        """Reconstruct from checkpoint file."""
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        hparams = checkpoint["hparams"]
+        model = cls(**hparams)
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        return model
+
 
 if __name__ == "__main__":
     print("Testing Stage 1 ML Ensembler...")

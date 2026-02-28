@@ -118,6 +118,32 @@ class TimeSeriesTransformer(nn.Module):
         trajectory_embedding = self.output_head(final_repr)
         return trajectory_embedding
 
+    def save(self, path):
+        """Save state_dict and constructor hyperparams."""
+        checkpoint = {
+            "state_dict": self.state_dict(),
+            "hparams": {
+                "num_features": self.input_projection.in_features,
+                "d_model": self.d_model,
+                "nhead": self.transformer_encoder.layers[0].self_attn.num_heads,
+                "num_layers": len(self.transformer_encoder.layers),
+                "dropout": self.transformer_encoder.layers[0].dropout.p,
+                "max_seq_len": self.max_seq_len,
+                "embedding_dim": self.output_head[-1].out_features,
+            },
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load(cls, path, map_location="cpu"):
+        """Reconstruct from checkpoint file."""
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        hparams = checkpoint["hparams"]
+        model = cls(**hparams)
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        return model
+
 
 if __name__ == "__main__":
     print("Testing Time-Series Transformer...")

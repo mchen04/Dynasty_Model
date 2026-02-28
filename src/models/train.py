@@ -1,4 +1,9 @@
+import argparse
+import json
 import os
+import subprocess
+import sys
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -8,6 +13,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.models.quantile_regressor import MultiTargetQuantilePool
+from src.models.serialization import ensure_dir, save_metadata
 from src.models.transformer import TimeSeriesTransformer
 from src.models.ensembler import Stage1Ensembler
 from src.preprocessing.sequence_builder import build_player_sequences
@@ -133,7 +139,42 @@ def _get_transformer_embeddings(model, df, config):
     return embeddings.numpy(), player_ids, row_map
 
 
-def run_training():
+def _get_git_sha():
+    """Get current git SHA, or 'unknown' if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _get_versions():
+    """Capture dependency versions for reproducibility."""
+    import lightgbm
+    versions = {
+        "python": sys.version,
+        "torch": torch.__version__,
+        "lightgbm": lightgbm.__version__,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+    }
+    try:
+        import mapie
+        versions["mapie"] = mapie.__version__
+    except Exception:
+        pass
+    try:
+        import optuna
+        versions["optuna"] = optuna.__version__
+    except Exception:
+        pass
+    return versions
+
+
+def run_training(save_artifacts=False, artifact_dir="artifacts"):
     print("Starting Walk-Forward Cross Validation Pipeline...")
     config = load_config()
 
@@ -231,13 +272,22 @@ def run_training():
 
         # 3. Train transformer
         print("  Training transformer...")
+        transformer = None
         try:
             transformer, seq_feats, train_pids = _train_transformer(
                 fit_df, feature_cols, config, max_epochs=30
             )
         except Exception as e:
             print(f"  Transformer training failed: {e}")
-            transformer = None
+
+        # Save fold artifacts
+        if save_artifacts:
+            fold_dir = os.path.join(artifact_dir, "models", f"fold_{test_year}")
+            ensure_dir(fold_dir)
+            print(f"  Saving fold artifacts to {fold_dir}...")
+            pool.save_all(fold_dir)
+            if transformer is not None:
+                transformer.save(os.path.join(fold_dir, "transformer.pt"))
 
         # 4. Predict and evaluate on test set
         all_preds = pool.predict_all(X_test)
@@ -278,6 +328,46 @@ def run_training():
                 print(f"  {stat} T+1 Average Floor Cal: {metrics_df[f'{stat}_floor_cal'].mean():.1f}%")
                 print(f"  {stat} T+1 Average Ceil Cal: {metrics_df[f'{stat}_ceil_cal'].mean():.1f}%")
 
+    # Save metrics and metadata
+    if save_artifacts:
+        metrics_dir = os.path.join(artifact_dir, "metrics")
+        ensure_dir(metrics_dir)
+        metrics_path = os.path.join(metrics_dir, "walk_forward_results.json")
+        with open(metrics_path, "w") as f:
+            json.dump(all_metrics, f, indent=2, default=str)
+        print(f"\nMetrics saved to {metrics_path}")
+
+        save_metadata(artifact_dir, {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "git_sha": _get_git_sha(),
+            "versions": _get_versions(),
+            "feature_cols": feature_cols,
+            "config_snapshot": config,
+            "walk_forward_folds": list(range(start_test_year, max_year + 1)),
+        })
+        print(f"Metadata saved to {os.path.join(artifact_dir, 'metadata.json')}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Dynasty Model training pipeline")
+    parser.add_argument(
+        "--save-artifacts",
+        action="store_true",
+        default=False,
+        help="Save trained model artifacts to disk",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default="artifacts",
+        help="Directory to save artifacts (default: artifacts/)",
+    )
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    run_training()
+    args = parse_args()
+    run_training(
+        save_artifacts=args.save_artifacts,
+        artifact_dir=args.artifact_dir,
+    )

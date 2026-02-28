@@ -1,0 +1,12 @@
+app = "dynasty-model-train"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  size = "performance-4x"
+
+[mounts]
+  source = "model_artifacts"
+  destination = "/output"

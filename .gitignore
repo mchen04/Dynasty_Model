@@ -18,3 +18,9 @@ venv.bak/
 # Data
 data/
 *.csv
+
+# Model artifacts
+artifacts/
+
+# Build artifacts
+*.egg-info/

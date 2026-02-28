@@ -1,0 +1,8 @@
+.venv/
+.git/
+data/raw/
+__pycache__/
+dynasty_model.egg-info/
+.claude/
+artifacts/
+*.pyc
