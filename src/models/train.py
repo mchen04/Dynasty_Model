@@ -576,9 +576,42 @@ def parse_args():
     return parser.parse_args()
 
 
+class _TeeWriter:
+    """Write to both stdout and a log file."""
+    def __init__(self, log_path):
+        self._stdout = sys.stdout
+        ensure_dir(os.path.dirname(log_path))
+        self._file = open(log_path, "w")
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+        self._file.flush()
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+        sys.stdout = self._stdout
+
+
 if __name__ == "__main__":
     args = parse_args()
-    run_training(
-        save_artifacts=args.save_artifacts,
-        artifact_dir=args.artifact_dir,
-    )
+
+    # Tee stdout to a log file inside the artifact dir
+    tee = None
+    if args.save_artifacts:
+        log_path = os.path.join(args.artifact_dir, "training.log")
+        tee = _TeeWriter(log_path)
+        sys.stdout = tee
+
+    try:
+        run_training(
+            save_artifacts=args.save_artifacts,
+            artifact_dir=args.artifact_dir,
+        )
+    finally:
+        if tee is not None:
+            tee.close()
