@@ -2,23 +2,12 @@
 
 ## Overview
 
-An ML model trained from scratch that predicts two values for any NBA player:
+Predicts two values for any NBA player:
 
-1. **Auction Startup Value** — what a player is worth in a fresh ESPN dynasty auction draft ($0–$200 scale)
-2. **Current Trade Value** — what a player is worth mid-season in an existing dynasty league (normalized 0–100 scale)
+1. **Auction Startup Value** ($1–$200) — startup dynasty auction price
+2. **Trade Value** (0–100) — relative dynasty asset value, 100 = most valuable
 
-The model is **league-configurable**: users can adjust team count, scoring system, and roster construction. Defaults to ESPN standard Head-to-Head (H2H) Points settings.
-
----
-
-## Target Outputs
-
-| Output | Scale | Description |
-|--------|-------|-------------|
-| `auction_value` | $1–$200 | Startup auction price (sum across all players = $200 × num_teams) |
-| `trade_value` | 0–100 | Relative dynasty asset value, where 100 = most valuable player in the league |
-
-Both outputs are **dynasty-aware**: they weight long-term future production, not just current-season projections. A 22-year-old averaging 18 PPG is worth more than a 33-year-old averaging 22 PPG.
+Both are **dynasty-aware**: a 22-year-old averaging 18 PPG is worth more than a 33-year-old averaging 22 PPG. League-configurable with ESPN H2H Points defaults.
 
 ---
 
@@ -26,199 +15,93 @@ Both outputs are **dynasty-aware**: they weight long-term future production, not
 
 ### Stage 0 — Data Harmonization & Imputation
 
-Handles missing positional data and advanced tracking stats for the pre-2014 era.
-- **Backcast Imputation Model**: Trains an auxiliary model exclusively on 2014–Present data predicting advanced metrics (RAPTOR, EPM, Tracking metrics like potential assists) from traditional play-by-play and box scores. 
-- Applies these predictions backwards to impute accurate spatial/impact data for players from 2001-2013, ensuring an unbroken long-term dataset for the temporal model.
+Backcasts missing tracking stats (Potential Assists, Passes Made, Assist Points Created) for the pre-2014 era. HistGradientBoosting models train on 2014+ data (~27 features) and predict backwards to 2001, producing an unbroken dataset. Separate models per metric.
 
-### Stage 1 — Probabilistic Stat Projection Model (League-Agnostic)
+### Stage 1 — Probabilistic Stat Projection (League-Agnostic)
 
-Predicts **probabilistic distributions** of per-game stats across future seasons, yielding 10th (Floor), 50th (Median), and 90th (Ceiling) percentile outcomes.
+Predicts floor (10th), median (50th), and ceiling (90th) percentile outcomes for **14 stats across 5 horizons** (T+1 through T+5):
+- **Efficiency**: PTS, REB, AST, STL, BLK, TOV, FGM, FGA, FTM, FTA, 3PM, 3PA
+- **Opportunity**: MP, G
 
-Crucially, **Stage 1 predicts Efficiency (per-100 possessions) and Opportunity (Minutes Share) separately.**
-Raw per-game stats are derived by multiplying these two predictions.
+**LightGBM quantile regressors** handle the cross-sectional snapshot (210 models: 14 stats × 5 horizons × 3 quantiles). Tuned via Optuna with TimeSeriesSplit CV, calibrated with MAPIE for guaranteed coverage intervals. NaN-native — no zero-filling.
 
-- **Input**: player features (see Feature Set below)
-- **Output**: Multi-quantile projected per-100 stats, minutes, and GP for seasons T+1 through T+5.
-- **Model**: Ensemble of Quantile Regression (e.g. NGBoost/LightGBM) + Time-Series Transformer
-  - The tree model handles the cross-sectional snapshot.
-  - The **Time-Series Transformer** elegantly processes a player's temporal career arc, using attention mechanisms to weigh specific developmental leaps and injury-shortened seasons simultaneously.
-  - Final prediction = probabilistic blend with ceiling/floor confidence intervals.
-- Trained once, shared across all league formats
+**Time-Series Transformer** (4-head, 2-layer, GELU, 64-dim) processes career sequences via self-attention, outputting a trajectory embedding that captures breakouts and decline.
 
-### Stage 2 — Configurable Valuation Layer (League-Specific)
+**Ensembler** blends tree predictions with trajectory corrections via per-stat learned alpha weights and an adjustment MLP. Monotonicity enforcement (sort) guarantees floor ≤ median ≤ ceiling.
 
-Converts projected stat lines into dollar/trade values based on league settings.
+### Stage 2 — Valuation Layer (League-Specific)
 
-- **Inputs**: Stage 1 projections + league configuration parameters
-- **Process**:
-  1. Apply scoring weights to projected stats → fantasy points per game
-  2. Weight fantasy points by projected games played, discounting for 'silly season' shutdown risks based on age and team context.
-  3. Discount future seasons using a dynasty time-value decay (year 1 = 1.0, year 2 = 0.85, year 3 = 0.72, year 4 = 0.61, year 5 = 0.52 — tunable)
-  4. Sum discounted values → total dynasty asset value
-  5. Compute positional replacement level based on league size, roster slots, and positional fluidity.
-  6. Calculate Value Over Replacement Player (VORP)
-  7. **Roster-Context Evaluation**: Recalculate VORP specifically for arbitrary team builds (Punt categories) by applying category weights. Yields two metrics: *Market Value* and *Roster Value*.
-  8. Convert VORP to auction dollars: `player_$ = (player_VORP / total_VORP_pool) × total_league_budget`
-  9. For trade value: normalize using a **non-linear power curve** to account for roster consolidation premiums (2-for-1 trades).
-- No ML training required — pure math, instantly recalculated for any league config based on owner's exact roster context.
+Pure math, no ML. Converts projections to dollars/trade values:
+
+1. Apply scoring weights → fantasy points per game
+2. Multiply by projected GP with **shutdown risk discounts**:
+   - Age ≥ 34: −15% (load management)
+   - Contender (W > 55) + age ≥ 30: −10% (resting)
+   - Tanking (W < 25): −10% (shutdown)
+   - Future years: −3% per year beyond T+1
+3. Discount future seasons (year 1: 1.0, year 2: 0.85, year 3: 0.72, year 4: 0.61, year 5: 0.52)
+4. Sum → dynasty FPTS. Subtract **positional replacement level** (blended for multi-position eligibility) → VORP
+5. Auction dollars: `player_$ = (VORP / total_VORP_pool) × league_budget`
+6. Trade value: power curve `100 × max(0, VORP)^1.2 / max_vorp^1.2` (consolidation premium)
+7. **Roster-context mode**: re-weight for punt builds, yielding Market Value, Roster Value, and VALUE_GAP (buy targets)
 
 ---
 
-## League Configuration Parameters
+## League Configuration
 
-| Parameter | Default (ESPN H2H Points) | Configurable Range |
-|-----------|------------------------|-------------------|
-| `num_teams` | 10 | 8, 10, 12, 14, 16, 20 |
-| `scoring_type` | `"points"` | `"points"`, `"custom"` |
+| Parameter | Default | Range |
+|-----------|---------|-------|
+| `num_teams` | 10 | 8–20 |
 | `budget_per_team` | $200 | $100–$500 |
 | `roster_size` | 13 | 10–20 |
-| `roster_slots` | PG, SG, SF, PF, C, G, F, UTIL×3, BN×3 | Custom |
-| `dynasty_horizon` | 5 years | 1–8 years |
-| `dynasty_discount_rate` | 0.85 per year | 0.5–1.0 |
-| `consolidation_premium` | 1.2 | 1.0 - 1.5 |
+| `dynasty_horizon` | 5 years | 1–8 |
+| `dynasty_discount_rate` | 0.85/yr | 0.5–1.0 |
+| `consolidation_premium` | 1.2 | 1.0–1.5 |
 
-### ESPN Default Points Scoring
+### ESPN H2H Points Scoring
 
-| Stat | Points | Net Effect |
-|------|--------|------------|
-| PTS | +1 | — |
-| REB | +1 | — |
-| AST | +2 | — |
-| STL | +4 | — |
-| BLK | +4 | — |
-| 3PM | +1 | — |
-| TO | -2 | — |
-| FGM | +2 | Made 2pt FG net = +3 (1 PTS + 2 FGM - 1 FGA) |
-| FGA | -1 | Made 3pt FG net = +5 (3 PTS + 1 3PM + 2 FGM - 1 FGA) |
-| FTM | +1 | Made FT net = +1 (1 PTS + 1 FTM - 1 FTA) |
-| FTA | -1 | Missed FT net = -1 (0 PTS + 0 FTM - 1 FTA) |
-| DD | +2 | Double-double bonus |
-| TD | +5 | Triple-double bonus |
+| Stat | Pts | Stat | Pts | Stat | Pts |
+|------|-----|------|-----|------|-----|
+| PTS | +1 | FGM | +2 | FTM | +1 |
+| REB | +1 | FGA | −1 | FTA | −1 |
+| AST | +2 | 3PM | +1 | DD | +2 |
+| STL | +4 | TOV | −2 | TD | +5 |
+| BLK | +4 | | | | |
 
 ---
 
-## Feature Set (Stage 1 Inputs)
+## Feature Set
 
-Everything. Organized into feature groups:
-
-### A. Core Box Score Stats (Per-Game + Per-100-Possessions)
-- Points, rebounds (offensive + defensive), assists, steals, blocks, turnovers
-- FGM/FGA/FG%, 3PM/3PA/3P%, FTM/FTA/FT%
-- Minutes per game, games played, games started
-- Personal fouls
-- All stats in both raw per-game AND per-100-possessions (pace-adjusted) forms
-
-### B. Advanced Individual Metrics
-- **Efficiency**: PER, True Shooting % (TS%), Effective FG% (eFG%)
-- **Impact**: BPM (Box Plus/Minus), OBPM, DBPM, VORP, Win Shares (WS), OWS, DWS, WS/48
-- **Usage**: Usage Rate (USG%), Assist Rate, Turnover Rate, Rebound Rate (ORB%, DRB%, TRB%)
-- **Shooting**: Free Throw Rate (FTr), 3-Point Attempt Rate (3PAr)
-- **Modern Plus-Minus**: RAPTOR (offensive, defensive, total) from FiveThirtyEight, EPM from DunksAndThrees (where available, 2014+)
-
-### C. Era-Adjusted Stats
-All counting stats are also stored as **within-season z-scores** — how many standard deviations above/below the league average for that season. This handles scoring inflation, pace changes, and the 3-point revolution automatically.
-
-Formula: `z_stat = (player_stat - season_mean) / season_std`
-
-### D. Biometric & Draft Profile
-- Age (exact, in years + days)
-- Height, weight, wingspan, standing reach (from combine data where available)
-- NBA draft year, pick number, draft position (1st round, 2nd round, undrafted)
-- Years of NBA experience
-- College (or international origin)
-- Years in college before declaring (1-and-done vs 4-year player)
-
-### E. Injury History
-- Career games missed (total and by season)
-- Games-played percentage: `games_played / possible_games` per season
-- Rolling games missed in last 1, 2, 3 seasons
-- Injury type encoding (one-hot by body region)
-- Injury severity encoding
-- Career-ending injury risk flag (ACL, Achilles)
-
-### F. Team Context (Decayed for Long-Term Forecasting)
-- Team win-loss record (current season)
-- Team offensive/defensive/net rating
-- Team pace
-- **Note:** For multi-year forecasting (T+2 and beyond), these features are artificially decayed back towards the league average, as team context is highly volatile long-term.
-
-### G. Role, Opportunity & Network Effects
-- Depth chart position
-- Minutes share: `player_minutes / team_total_minutes`
-- Usage rate & Passer Rating (tracker data)
-- **Usage Vacuums (Network Effect)**: `team_vacated_usage` measuring how much total usage rate from the prior season's roster is leaving in free agency/trades, creating a "development vacuum" for remaining young players.
-- **Coaching Tags**: One-hot/Categorical embedding of the Head Coach and offensive system to boost/penalize pace and rotation tightness.
-
-### H. Historical Trajectory Features (Transformer Sequence Inputs)
-For the LSTM component, feed a **sequence of season-level feature vectors** representing the player's entire career:
-- Per-season: all stats from groups A–G aggregated at the season level
-- Padded/masked for players with fewer seasons
-
-### I. Rolling Momentum Features
-- Last 10/20/40 game rolling averages for key stats
-- Trend direction and breakout detection.
+| Group | Features |
+|-------|----------|
+| **Box Score** | PTS, REB, AST, STL, BLK, TOV, FGM/A, 3PM/A, FTM/A, MP, G, GS, PF — per-game and per-100 |
+| **Advanced** | PER, TS%, eFG%, BPM/OBPM/DBPM, VORP, WS/OWS/DWS/WS48, USG%, AST%/TOV%/REB%, FTr, 3PAr, EPM (2014+) |
+| **Era-Adjusted** | Within-season z-scores for all counting stats: `z = (stat − season_mean) / season_std` |
+| **Biometric** | Age, height, weight, wingspan, standing reach, draft year/round/pick, experience, college |
+| **Injury** | Games missed (season-length-aware: 66/73/72 for lockout/bubble/COVID), GP%, rolling 1/2/3-season missed games, injury-prone flag (40+ missed in 3yr) |
+| **Age Curve** | Age², years from position-specific peak (PG/SG/SF: 27, PF/C: 26), pre-peak flag, contract year proxy |
+| **Team Context** | W-L, ORtg/DRtg/NRtg, Pace (decayed toward league average for T+2+) |
+| **Network** | Depth chart rank, usage vacuums (departed teammate USG%), teammate TS% (minute-weighted), coach ID |
+| **Trajectory** | Full career season sequences (pre-padded, masked) for transformer input |
+| **Momentum** | Season-over-season deltas, 3yr EWMA, breakout flags (>1σ delta) — all lagged |
 
 ---
 
-## Training Data
+## Training
 
-### Era Definition: "Modern NBA" = 2001-02 to Present
-- Zone defense was legalized in 2001-02.
-- Fits seamlessly with Era-Adjusted stats (Z-scores per season).
+**Data**: 2001-02 to present ("Modern NBA" — zone defense legalized). All players included regardless of minutes to prevent survivorship bias.
 
-### Data Pipeline & Survivor Bias Prevention
-The training dataset includes **all players** who logged an official NBA minute. Filtering out low-minute players or rapid wash-outs creates extreme survivorship bias, destroying the LSTM's ability to recognize "bust" trajectories. The target population is the entire drafting pool.
+**Walk-forward CV**: For each test year, train on all prior seasons. Fit/calibration split within training data (last 15% of seasons held for MAPIE calibration). Optuna tuning on first fold only, params reused.
 
-### Target Variable Strategy
-The Stage 1 model predicts **raw stats via Efficiency and Opportunity**, not fantasy points or dollar values directly.
-
-Multiple Output Regression Strategy:
-1. Predict `Per-100 Stats` (Efficiency/Skill)
-2. Predict `Minutes Share` (Opportunity)
-3. Predict `Current Team Context` (Pace)
-4. Derive `Per-Game Stats` mathematically.
+**Targets**: NaN left as NaN (career endings are structurally informative). LightGBM handles natively; transformer uses padding masks.
 
 ---
 
-## Model Training Details
+## Evaluation
 
-### Quantile Regression Component
-- **Architecture**: NGBoost, CatBoost, or LightGBM with quantile error functions.
-- **Features**: all tabular features from groups A–I.
-- **Hyperparameter tuning**: Bayesian optimization (Optuna) with 5-fold time-series cross-validation.
-
-### Time-Series Transformer Component
-- **Architecture**: Transformer encoder blocks (multi-head self-attention) adapted for tabular series.
-- **Training Strategy**: Uses positional encoding to gracefully handle missing/shortened injury seasons. Explicitly fed historical busts to prevent survivorship bias and train accurate 10th-percentile (floor) outcomes.
-
-### Ensemble Blend
-- `final_prediction = α × xgb_prediction + (1 - α) × lstm_prediction`
-
----
-
-## Dynasty-Specific Modeling Considerations
-
-### Age Curves and The "Wash Out" Risk
-The model implicitly learns that players peak at **age 26-28**. Because the LSTM is fed full distributions of all players (no minute minimums), a 21-year-old performing poorly is aggressively penalized toward a "wash out" trajectory, rather than erroneously mapped to a late bloomer who simply survived. 
-
-### Shutdown Risk & "Silly Season"
-Fantasy values are directly impacted by when games are played. Stage 2 applies a **Playoff Likelihood Discount**. Older players on contending 'locked' seeds or tanking teams receive a fractional value discount mirroring their likelihood to be rested during fantasy playoffs (Weeks 20-23).
-
----
-
-## Valuation Math (Stage 2)
-
-### VORP Calculation
-Positional eligibility is treated dynamically. A player with PF/C eligibility is compared against a blended replacement level of both positions, creating inherent value boosts for multi-positional elasticity.
-
-### Consolidative Trade Normalization
-A simple linear map of VORP produces poor 2-for-1 trade logic. Trade value is normalized using a non-linear power curve:
-
-```
-normalized_vorp = max(0, player_dynasty_VORP)^consolidation_premium
-trade_value = 100 × (normalized_vorp / max_normalized_vorp)
-```
-Where `consolidation_premium` (e.g., 1.2) appropriately values top-tier assets requiring massive packages in return.
+- **Quantile calibration**: ~80% of actuals within floor–ceiling, per stat and horizon
+- **Dynasty backtesting**: Spearman rank correlation (predicted dynasty value vs realized 3yr FPTS), RMSE, top-30 hit rate (% in actual top-50)
+- **Trade decisions**: Pairwise accuracy on similarly-valued players (within 30%) — did the model correctly identify who produced more?
 
 ---
 
@@ -226,22 +109,38 @@ Where `consolidation_premium` (e.g., 1.2) appropriately values top-tier assets r
 
 ```
 Dynasty_Model/
+├── configs/
+│   └── config.yaml               # All paths, league defaults, hyperparameters
 ├── docs/
-│   ├── spec.md                  # This file
-│   └── spec_review.md           # Critical review and methodologies
+│   └── spec.md
 ├── data/
 │   ├── raw/
-│   ├── processed/
-│   └── features/
+│   └── processed/
 ├── src/
+│   ├── utils/
+│   │   ├── config.py              # load_config(), resolve_path()
+│   │   ├── constants.py           # BBR_TEAM_MAPPING, COLUMN_RENAME_MAP
+│   │   └── data_loader.py         # load_raw_dataset() with auto-renames
 │   ├── scraping/
+│   │   ├── bball_ref_scraper.py
+│   │   ├── build_dataset.py
+│   │   └── nba_api_client.py
 │   ├── preprocessing/
+│   │   ├── run_pipeline.py
+│   │   ├── advanced_feature_engineer.py
+│   │   ├── imputer.py             # BackcastImputer, MultiMetricImputer
+│   │   ├── zscores.py
+│   │   ├── network_effects.py
+│   │   └── sequence_builder.py
 │   ├── models/
+│   │   ├── train.py               # Walk-forward CV
+│   │   ├── quantile_regressor.py  # LightGBM + MAPIE
+│   │   ├── transformer.py
+│   │   └── ensembler.py
 │   ├── valuation/
+│   │   └── vorp_calculator.py     # DynastyValuationEngine
 │   └── evaluation/
-├── notebooks/
-├── configs/
-├── tests/
-├── requirements.txt
-└── README.md
+│       └── evaluator.py
+├── pyproject.toml
+└── requirements.txt
 ```

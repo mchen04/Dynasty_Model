@@ -1,91 +1,91 @@
 import torch
 import torch.nn as nn
 
+from src.utils.config import load_config
+
 
 class Stage1Ensembler(nn.Module):
     """
-    Blends the discrete cross-sectional predictions from the Quantile Regressor
-    with the longitudinal trajectory embeddings from the Time-Series Transformer.
+    Blends tree quantile predictions with transformer trajectory embeddings.
 
-    This ensures we don't just rely on "last year's stats" (Quantile) but also factor in
-    whether the player is on a rising breakout trajectory or a declining washout trajectory (Transformer).
+    Takes:
+    - Tree predictions: (batch, num_stats, 3) for floor/median/ceiling per stat
+    - Transformer trajectory embedding: (batch, embedding_dim)
+
+    Per-stat learned alpha weights let some stats benefit more from trajectory info.
+    Monotonicity enforcement guarantees floor <= median <= ceiling.
     """
 
-    def __init__(self, c_dim=3, t_dim=16, alpha_trainable=True):
-        """
-        c_dim: number of outputs from cross-sectional model (e.g., Floor, Median, Ceiling)
-        t_dim: number of dimensions from transformer sequence embedding
-        alpha_trainable: whether to dynamically learn the blend weight between the two models
-        """
-        super(Stage1Ensembler, self).__init__()
+    def __init__(self, num_stats=None, embedding_dim=None):
+        super().__init__()
+        config = load_config()
 
-        # We can either use a fixed math blend, or a neural layer to intelligently combine them
-        self.combiner = nn.Sequential(
-            nn.Linear(c_dim + t_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, c_dim),  # Outputs the finalized Floor, Median, Ceiling
+        if num_stats is None:
+            num_stats = len(config["model"]["target_stats"])
+        if embedding_dim is None:
+            embedding_dim = config["model"]["transformer"]["embedding_dim"]
+
+        self.num_stats = num_stats
+        self.embedding_dim = embedding_dim
+
+        # Per-stat alpha weights (sigmoid-bounded to [0, 1])
+        self.alpha_logits = nn.Parameter(torch.zeros(num_stats))
+
+        # Trajectory-to-adjustment MLP: embedding -> additive corrections
+        self.trajectory_mlp = nn.Sequential(
+            nn.Linear(embedding_dim, 128),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, num_stats * 3),  # 3 corrections per stat (floor/median/ceiling)
         )
 
-        # Alternatively, a simple learned scalar blend: Output = alpha*C + (1-alpha)*T_projected
-        self.alpha = nn.Parameter(torch.tensor(0.5)) if alpha_trainable else 0.5
-        self.t_projector = nn.Linear(t_dim, c_dim)
-
-    def forward(
-        self, cross_sectional_preds, transformer_embeddings, use_neural_blend=False
-    ):
+    def forward(self, tree_preds, trajectory_embedding):
         """
-        cross_sectional_preds: (Batch, 3) -> [Floor, Median, Ceiling] from Quantile Regressor
-        transformer_embeddings: (Batch, 16) -> Trajectory vector from Time-Series Transformer
+        tree_preds: (batch, num_stats, 3) - [floor, median, ceiling] per stat
+        trajectory_embedding: (batch, embedding_dim)
+        Returns: (batch, num_stats, 3) - ensembled and monotonicity-enforced
         """
-        if use_neural_blend:
-            # Concatenate and pass through MLP
-            combined = torch.cat([cross_sectional_preds, transformer_embeddings], dim=1)
-            final_predictions = self.combiner(combined)
-            return final_predictions
-        else:
-            # Simple weighted alpha blend
-            # First map the 16-D trajectory into the 3-D output space
-            t_mapped = self.t_projector(transformer_embeddings)
+        batch_size = tree_preds.size(0)
 
-            # Blend
-            final_predictions = (self.alpha * cross_sectional_preds) + (
-                (1 - self.alpha) * t_mapped
-            )
-            return final_predictions
+        # Per-stat blending alphas
+        alphas = torch.sigmoid(self.alpha_logits)  # (num_stats,)
+        alphas = alphas.unsqueeze(0).unsqueeze(-1)  # (1, num_stats, 1)
+
+        # Trajectory corrections
+        corrections = self.trajectory_mlp(trajectory_embedding)  # (batch, num_stats*3)
+        corrections = corrections.view(batch_size, self.num_stats, 3)
+
+        # Blend: alpha * tree_preds + (1-alpha) * (tree_preds + corrections)
+        # Simplifies to: tree_preds + (1-alpha) * corrections
+        blended = tree_preds + (1 - alphas) * corrections
+
+        # Monotonicity enforcement: sort ascending to guarantee floor <= median <= ceiling
+        blended_sorted, _ = torch.sort(blended, dim=-1)
+
+        return blended_sorted
 
 
 if __name__ == "__main__":
     print("Testing Stage 1 ML Ensembler...")
 
     batch_size = 4
+    num_stats = 14
+    embedding_dim = 64
 
-    # 1. Output from Quantile Regressor (e.g., predicting T+1 Minutes Share)
-    # [10th_Floor, 50th_Median, 90th_Ceiling]
-    mock_quantile_preds = torch.tensor(
-        [
-            [0.10, 0.25, 0.35],  # Player A (Role player)
-            [0.40, 0.50, 0.55],  # Player B (Starter)
-            [0.60, 0.70, 0.75],  # Player C (Star)
-            [0.05, 0.15, 0.40],  # Player D (High variance rookie)
-        ]
-    )
+    mock_tree_preds = torch.rand(batch_size, num_stats, 3)
+    # Sort to simulate proper floor < median < ceiling
+    mock_tree_preds, _ = torch.sort(mock_tree_preds, dim=-1)
 
-    # 2. Output from Transformer (16-D sequence embedding)
-    mock_transformer_embeds = torch.rand(batch_size, 16)
+    mock_embeddings = torch.rand(batch_size, embedding_dim)
 
-    # Initialize Ensembler
-    ensembler = Stage1Ensembler(c_dim=3, t_dim=16, alpha_trainable=True)
+    ensembler = Stage1Ensembler(num_stats=num_stats, embedding_dim=embedding_dim)
+    output = ensembler(mock_tree_preds, mock_embeddings)
 
-    # Blend them!
-    final_outputs = ensembler(
-        mock_quantile_preds, mock_transformer_embeds, use_neural_blend=True
-    )
+    print(f"Tree Predictions Shape: {mock_tree_preds.shape}")
+    print(f"Trajectory Embedding Shape: {mock_embeddings.shape}")
+    print(f"Ensembled Output Shape: {output.shape}")
 
-    print("\nOriginal Quantile Estimations (Cross-Sectional Only):")
-    print(mock_quantile_preds)
-
-    print("\nFinal Ensembled Predictions (Blended with Career Trajectory Context):")
-    print(final_outputs.detach())
-    print(
-        "\nEnsemble successful. Trajectory features altered the base quantile expectations."
-    )
+    # Verify monotonicity
+    diffs = output[:, :, 1:] - output[:, :, :-1]
+    assert (diffs >= 0).all(), "Monotonicity violated!"
+    print("Monotonicity enforced: floor <= median <= ceiling for all stats.")

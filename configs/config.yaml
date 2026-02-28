@@ -1,0 +1,170 @@
+# Dynasty Model Configuration — Single Source of Truth
+
+project:
+  name: "Dynasty Model"
+  data_dir: "data"
+  raw_data: "data/raw/historical_nba_dataset.csv"
+  processed_data: "data/processed/historical_nba_dataset_processed.csv"
+
+scraping:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+  bref_delay: 5.0          # seconds between Basketball-Reference requests
+  bref_player_delay: 2.0   # seconds between individual player requests
+  nba_api_delay: 1.0       # seconds between NBA API requests
+  coach_delay: 2.5         # seconds between coach page requests
+  start_year: 2002
+  end_year: 2026
+
+league:
+  num_teams: 10
+  roster_size: 13
+  total_budget: 200
+  dynasty_horizon: 5
+  dynasty_discount_rate: 0.85
+  consolidation_premium: 1.2
+  scoring_weights:
+    PTS: 1
+    REB: 1
+    AST: 2
+    STL: 4
+    BLK: 4
+    TOV: -2
+    FGM: 2
+    FGA: -1
+    FTM: 1
+    FTA: -1
+    3PM: 1
+  dynasty_discount_curve:
+    1: 1.0
+    2: 0.85
+    3: 0.72
+    4: 0.61
+    5: 0.52
+
+model:
+  # Walk-forward CV
+  initial_train_years: 15
+
+  # Quantile regression
+  quantile_alphas: [0.1, 0.5, 0.9]
+
+  # Target stats for multi-horizon prediction
+  target_stats:
+    - PTS
+    - REB
+    - AST
+    - STL
+    - BLK
+    - TOV
+    - FGM
+    - FGA
+    - FTM
+    - FTA
+    - 3PM
+    - 3PA
+    - MP
+    - G
+  horizons: [1, 2, 3, 4, 5]
+
+  # Transformer
+  transformer:
+    d_model: 64
+    nhead: 4
+    num_layers: 2
+    dropout: 0.1
+    max_seq_len: 15
+    embedding_dim: 64  # output embedding dimension
+
+  # LightGBM defaults (Optuna will tune these)
+  lgbm_defaults:
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 6
+    num_leaves: 31
+    min_child_samples: 20
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+  # Optuna
+  optuna_n_trials: 50
+  optuna_cv_splits: 5
+
+preprocessing:
+  # Stats to z-score
+  zscore_stats:
+    - PTS
+    - REB
+    - AST
+    - STL
+    - BLK
+    - TOV
+    - FGA
+    - FGM
+    - 3PA
+    - 3PM
+    - FTA
+    - FTM
+    - PTS_per100
+    - REB_per100
+    - AST_per100
+    - STL_per100
+    - BLK_per100
+    - TOV_per100
+
+  # Imputation targets (tracking stats available 2014+)
+  imputation_targets:
+    - POTENTIAL_AST
+    - PASSES_MADE
+    - AST_POINTS_CREATED
+
+  # Season game counts (non-82 seasons)
+  season_games:
+    2012: 66   # lockout
+    2020: 73   # bubble
+    2021: 72   # COVID
+    default: 82
+
+  # Position-specific peak ages
+  peak_ages:
+    PG: 27
+    SG: 27
+    SF: 27
+    PF: 26
+    C: 26
+    default: 27
+
+  # Momentum stats for rolling features
+  momentum_stats:
+    - PTS
+    - AST
+    - REB
+    - TS_PCT
+    - USG_PCT
+    - MP
+
+  # Contract year proxy experience values
+  contract_years: [3, 7, 11]
+
+  # Shutdown risk thresholds
+  shutdown:
+    age_load_management: 34
+    age_contender_rest: 30
+    contender_wins: 55
+    tanking_wins: 25
+    load_management_discount: 0.15
+    contender_rest_discount: 0.10
+    tanking_discount: 0.10
+    future_year_discount: 0.03
+
+valuation:
+  # Positional roster slots (for replacement level calc)
+  roster_slots:
+    PG: 1
+    SG: 1
+    SF: 1
+    PF: 1
+    C: 1
+    G: 1     # PG or SG eligible
+    F: 1     # SF or PF eligible
+    UTIL: 3
+    BN: 3

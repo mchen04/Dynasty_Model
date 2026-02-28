@@ -1,16 +1,18 @@
+import math
+
 import torch
 import torch.nn as nn
-import math
+
+from src.utils.config import load_config
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=20):
-        super(PositionalEncoding, self).__init__()
+    def __init__(self, d_model, dropout=0.1, max_len=15):
+        super().__init__()
         self.dropout = nn.Dropout(p=dropout)
 
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        # We scale by something dependent on d_model
         div_term = torch.exp(
             torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
         )
@@ -21,7 +23,7 @@ class PositionalEncoding(nn.Module):
         else:
             pe[:, 1::2] = torch.cos(position * div_term)
 
-        pe = pe.unsqueeze(0).transpose(0, 1)  # Shape: (max_len, 1, d_model)
+        pe = pe.unsqueeze(0).transpose(0, 1)  # (max_len, 1, d_model)
         self.register_buffer("pe", pe)
 
     def forward(self, x):
@@ -34,106 +36,107 @@ class TimeSeriesTransformer(nn.Module):
     """
     Stage 1 - Longitudinal Trajectory Processor
 
-    Predicts the likelihood of a player breaking out vs washing out
-    by interpreting their historical z-scored performance sequences.
-    Replaces the LSTM per the 2026 specs for better long-term attention.
+    Processes player historical z-scored performance sequences using
+    multi-head self-attention. Outputs a 64-dim trajectory embedding
+    that feeds into the ensembler.
     """
 
     def __init__(
         self,
         num_features,
-        d_model=64,
-        nhead=4,
-        num_layers=2,
-        dropout=0.1,
-        max_seq_len=15,
+        d_model=None,
+        nhead=None,
+        num_layers=None,
+        dropout=None,
+        max_seq_len=None,
+        embedding_dim=None,
     ):
-        super(TimeSeriesTransformer, self).__init__()
-        self.d_model = d_model
-        self.max_seq_len = max_seq_len
+        super().__init__()
+        config = load_config()
+        t_cfg = config["model"]["transformer"]
 
-        # 1. Project input features up to Transformer hidden dimension
-        self.input_projection = nn.Linear(num_features, d_model)
+        self.d_model = d_model or t_cfg["d_model"]
+        self.max_seq_len = max_seq_len or t_cfg["max_seq_len"]
+        nhead = nhead or t_cfg["nhead"]
+        num_layers = num_layers or t_cfg["num_layers"]
+        dropout = dropout if dropout is not None else t_cfg["dropout"]
+        embedding_dim = embedding_dim or t_cfg["embedding_dim"]
 
-        # 2. Inject Positional Encoding (Absolute time steps)
-        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=max_seq_len)
+        self.input_projection = nn.Linear(num_features, self.d_model)
 
-        # 3. Transformer Encoder Blocks
-        encoder_layers = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True,  # PyTorch 1.9+ supports batch_first
+        self.pos_encoder = PositionalEncoding(
+            self.d_model, dropout, max_len=self.max_seq_len
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
 
-        # 4. Final Projection Head (Predicts multi-outputs like Mins_Share, TS%, Usage)
-        # We'll output a hidden representation that gets ensemble-blended later
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=nhead,
+            dim_feedforward=self.d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+
         self.output_head = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.ReLU(),
-            nn.Linear(
-                32, 16
-            ),  # 16-dim representation vector of the player's vector trajectory
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.d_model, embedding_dim),
         )
 
     def forward(self, src, src_key_padding_mask=None):
         """
-        src shape: (batch_size, seq_len, num_features)
-        src_key_padding_mask shape: (batch_size, seq_len) - True for padded elements
+        src: (batch_size, seq_len, num_features)
+        src_key_padding_mask: (batch_size, seq_len) - True for padded positions
+        Returns: (batch_size, embedding_dim) trajectory embedding
         """
-        # Project features
         x = self.input_projection(src)  # (batch, seq, d_model)
 
-        # Transformer expects (seq_len, batch, d_model) if batch_first=False
-        # Since batch_first=True, we keep it as (batch, seq, d_model)
-
-        # Apply Positional Encoding (needs to swap back to seq, batch for pos_encoder)
-        # Our pos_encoder assumes (seq, batch, features) internally
-        x = x.transpose(0, 1)  # -> (seq, batch, dim)
+        # Positional encoding expects (seq, batch, d_model)
+        x = x.transpose(0, 1)
         x = self.pos_encoder(x)
-        x = x.transpose(0, 1)  # -> (batch, seq, dim)
+        x = x.transpose(0, 1)  # back to (batch, seq, d_model)
 
-        # Pass through Transformer
         output = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
 
-        # We care about the final time step's prediction representation (T+1 context)
-        # Assuming the sequence is chronologically ordered and left-padded with 0s
-        # (Though we can use the padding mask to find the true last element, normally
-        # sequences are right-padded or we grab the last element if all are fixed length)
-        # For simplicity in this scaffold, let's grab the last step of the sequence.
-        final_step_repr = output[:, -1, :]
+        # Extract last valid position using padding mask
+        if src_key_padding_mask is not None:
+            # ~mask gives valid positions; find the last valid index per batch
+            valid_mask = ~src_key_padding_mask  # True = valid
+            # Get index of last valid position
+            # Use argmax on reversed valid_mask to find last True
+            seq_len = valid_mask.shape[1]
+            last_valid_idx = seq_len - 1 - valid_mask.flip(dims=[1]).float().argmax(dim=1)
+            last_valid_idx = last_valid_idx.long()
 
-        # Project to target
-        trajectory_embedding = self.output_head(final_step_repr)
+            batch_idx = torch.arange(output.size(0), device=output.device)
+            final_repr = output[batch_idx, last_valid_idx, :]
+        else:
+            final_repr = output[:, -1, :]
+
+        trajectory_embedding = self.output_head(final_repr)
         return trajectory_embedding
 
 
 if __name__ == "__main__":
-    print("Testing Time-Series Transformer Scaffold...")
+    print("Testing Time-Series Transformer...")
 
-    # Simulate a batch of 2 players, 5 historical seasons, 10 advanced features
     batch_size = 2
     seq_len = 5
     num_features = 10
 
-    # Random tensor simulating the output of `sequence_builder.py`
-    mock_input_seq = torch.rand(batch_size, seq_len, num_features)
+    mock_input = torch.rand(batch_size, seq_len, num_features)
 
-    # Player 1 has 5 valid seasons, Player 2 only has 3 (so 2 padded zeros)
-    # True = Ignore this position (it's padding)
+    # Player 1: 5 valid seasons, Player 2: 3 valid (2 padded at start)
     padding_mask = torch.tensor(
         [[False, False, False, False, False], [True, True, False, False, False]]
     )
 
-    model = TimeSeriesTransformer(num_features=num_features, max_seq_len=5)
+    model = TimeSeriesTransformer(num_features=num_features, max_seq_len=5, embedding_dim=64)
 
-    # Forward pass
-    trajectory_embeddings = model(mock_input_seq, src_key_padding_mask=padding_mask)
+    embeddings = model(mock_input, src_key_padding_mask=padding_mask)
 
-    print(f"Input Shape: {mock_input_seq.shape} -> (Batch, Seq_Len, Features)")
-    print(
-        f"Trajectory Output Shape: {trajectory_embeddings.shape} -> (Batch, Embedded_Dims)"
-    )
-    print("Successfully processed sequence through multi-head self-attention.")
+    print(f"Input Shape: {mock_input.shape}")
+    print(f"Embedding Shape: {embeddings.shape} (expected: [2, 64])")
+    print("Transformer forward pass successful.")

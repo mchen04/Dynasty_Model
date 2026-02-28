@@ -1,8 +1,16 @@
-from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashptstats
 import time
 
+from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashptstats
 
-def get_nba_tracking_stats(season="2024-25"):
+from src.utils.config import load_config
+
+
+def _api_delay():
+    config = load_config()
+    time.sleep(config["scraping"]["nba_api_delay"])
+
+
+def get_nba_tracking_stats(season):
     """
     Fetches active player tracking stats (e.g., potential assists, passes)
     from stats.nba.com.
@@ -10,7 +18,6 @@ def get_nba_tracking_stats(season="2024-25"):
     """
     print(f"Fetching tracking stats (Passing) for {season}...")
     try:
-        # PtMeasureType: 'Passing', 'CatchShoot', 'SpeedDistance', etc.
         tracking = leaguedashptstats.LeagueDashPtStats(
             season=season,
             pt_measure_type="Passing",
@@ -18,14 +25,14 @@ def get_nba_tracking_stats(season="2024-25"):
             per_mode_simple="PerGame",
         )
         df = tracking.get_data_frames()[0]
-        time.sleep(1)  # Be courteous to the API
+        _api_delay()
         return df
     except Exception as e:
         print(f"Error fetching tracking stats: {e}")
         return None
 
 
-def get_nba_base_stats(season="2024-25", per_mode="Per100Possessions"):
+def get_nba_base_stats(season, per_mode="Per100Possessions"):
     """
     Fetches base or advanced stats from stats.nba.com.
     per_mode options: "PerGame", "Per100Possessions", "Totals"
@@ -36,14 +43,14 @@ def get_nba_base_stats(season="2024-25", per_mode="Per100Possessions"):
             season=season, per_mode_detailed=per_mode
         )
         df = stats.get_data_frames()[0]
-        time.sleep(1)
+        _api_delay()
         return df
     except Exception as e:
         print(f"Error fetching base stats: {e}")
         return None
 
 
-def get_nba_bio_stats(season="2024-25"):
+def get_nba_bio_stats(season):
     """
     Fetches biological and draft data (Height, Weight, College, Draft Pick) from stats.nba.com.
     """
@@ -53,7 +60,7 @@ def get_nba_bio_stats(season="2024-25"):
 
         stats = leaguedashplayerbiostats.LeagueDashPlayerBioStats(season=season)
         df = stats.get_data_frames()[0]
-        time.sleep(1)
+        _api_delay()
         return df
     except Exception as e:
         print(f"Error fetching bio stats: {e}")
@@ -61,7 +68,6 @@ def get_nba_bio_stats(season="2024-25"):
 
 
 if __name__ == "__main__":
-    # Test tracking stats (e.g. potential assists)
     tracking_df = get_nba_tracking_stats("2024-25")
     if tracking_df is not None:
         print(
@@ -79,7 +85,6 @@ if __name__ == "__main__":
             ].head()
         )
 
-    # Test per 100 stats
     per100_df = get_nba_base_stats("2024-25", "Per100Possessions")
     if per100_df is not None:
         print(f"Successfully fetched Per 100 stats for {len(per100_df)} players.")

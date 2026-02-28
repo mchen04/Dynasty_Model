@@ -1,5 +1,5 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
@@ -9,56 +9,60 @@ class BackcastImputer:
     """
     Stage 0 - Data Harmonization & Imputation.
 
-    This model trains exclusively on Modern Era data (2014-Present) where tracking
-    stats (like Potential Assists) exist. It learns the relationship between standard
-    play-by-play/box score stats and these advanced metrics.
+    Trains on Modern Era data (2014-Present) where tracking stats exist.
+    Learns the relationship between standard box score stats and advanced metrics,
+    then backcasts predictions to pre-2014 era for unbroken historical dataset.
 
-    It is then used to predict (backfill) these tracking metrics for players from
-    2001-2013, ensuring an unbroken long-term dataset for the temporal model.
+    Supports multiple target metrics trained independently.
     """
+
+    # Expanded feature set (~27 features)
+    CORE_FEATURES = [
+        "PTS", "AST", "REB", "STL", "BLK", "TOV",
+        "FGA", "FGM", "FTA", "FTM", "3PA", "3PM",
+        "MP", "AGE", "GS", "ORB", "DRB", "PF",
+        "PER", "TS_PCT", "USG_PCT", "AST_PCT", "TOV_PCT",
+        "EFG_PCT", "BPM", "WS",
+    ]
+
+    # Fallback column name aliases for features that may have B-Ref names
+    FEATURE_ALIASES = {
+        "FGM": "FG", "FTM": "FT", "3PM": "3P",
+        "REB": "TRB", "AGE": "Age",
+        "TS_PCT": "TS%", "USG_PCT": "USG%", "AST_PCT": "AST%",
+        "TOV_PCT": "TOV%", "EFG_PCT": "eFG%",
+    }
 
     def __init__(self, target_metric):
         self.target_metric = target_metric
-        # HistGradientBoosting handles NaN values natively, exactly what we want
         self.model = HistGradientBoostingRegressor(
             max_iter=200, random_state=42, early_stopping=True
         )
         self.is_trained = False
+        self._feature_cols = None
 
     def _select_features(self, df):
         """
-        Selects standard box score and play-by-play features available since 2001.
+        Selects available features from the expanded core set.
+        Falls back to aliases if canonical names aren't present.
         """
-        # In a full implementation, this list would be comprehensive.
-        # Here we use the core statistical footprint that proxies tracking data.
-        core_features = [
-            "PTS",
-            "AST",
-            "REB",
-            "STL",
-            "BLK",
-            "TOV",
-            "FGA",
-            "FGM",
-            "FTA",
-            "FTM",
-            "3PA",
-            "3PM",
-            "MIN",
-            "AGE",
-        ]
+        if self._feature_cols is not None:
+            return df[self._feature_cols]
 
-        # Keep only features that actually exist in the dataframe
-        available_features = [f for f in core_features if f in df.columns]
-        return df[available_features]
+        available = []
+        for feat in self.CORE_FEATURES:
+            if feat in df.columns:
+                available.append(feat)
+            elif feat in self.FEATURE_ALIASES and self.FEATURE_ALIASES[feat] in df.columns:
+                available.append(self.FEATURE_ALIASES[feat])
+
+        self._feature_cols = available
+        return df[available]
 
     def train(self, df):
-        """
-        Train the imputation model using rows where the target_metric is NOT null.
-        """
+        """Train the imputation model using rows where the target_metric is NOT null."""
         print(f"Training imputer for missing metric: {self.target_metric}")
 
-        # Filter to rows where target exists (e.g., post-2014 players)
         train_df = df.dropna(subset=[self.target_metric])
         if len(train_df) == 0:
             raise ValueError(
@@ -74,87 +78,101 @@ class BackcastImputer:
 
         self.model.fit(X_train, y_train)
 
-        # Evaluate
         preds = self.model.predict(X_test)
         rmse = np.sqrt(mean_squared_error(y_test, preds))
         r2 = r2_score(y_test, preds)
 
-        print(f"Model trained. Validation RMSE = {rmse:.4f}, R2 = {r2:.4f}")
+        print(f"  Model trained on {len(X_train)} samples with {len(self._feature_cols)} features.")
+        print(f"  Validation RMSE = {rmse:.4f}, R2 = {r2:.4f}")
         self.is_trained = True
         return self
 
     def impute(self, df):
-        """
-        Predict the target metric for rows where it is currently NaN.
-        """
+        """Predict the target metric for rows where it is currently NaN."""
         if not self.is_trained:
             raise RuntimeError("Model must be trained before imputation.")
 
         imputed_df = df.copy()
 
-        # Find rows missing the target metric (e.g., pre-2014 players)
         missing_mask = imputed_df[self.target_metric].isna()
         num_missing = missing_mask.sum()
 
         if num_missing == 0:
-            print("No missing values found to impute.")
+            print(f"  No missing values found for {self.target_metric}.")
             return imputed_df
 
-        print(f"Imputing {num_missing} missing rows for {self.target_metric}...")
+        print(f"  Imputing {num_missing} missing rows for {self.target_metric}...")
 
         X_missing = self._select_features(imputed_df[missing_mask])
-
-        # Fill missing values with predictions
         predictions = self.model.predict(X_missing)
         imputed_df.loc[missing_mask, self.target_metric] = predictions
 
         return imputed_df
 
 
-if __name__ == "__main__":
-    # --- Integration Test / Demonstration ---
-    print("Testing Stage 0 Imputer Logic...")
+class MultiMetricImputer:
+    """Trains and applies BackcastImputer for multiple target metrics."""
 
-    # Simulate some 2014+ data (has potential assists)
+    def __init__(self, target_metrics):
+        self.target_metrics = target_metrics
+        self.imputers = {m: BackcastImputer(target_metric=m) for m in target_metrics}
+
+    def train_all(self, df):
+        """Train a separate imputer for each target metric."""
+        for metric, imputer in self.imputers.items():
+            if metric not in df.columns:
+                print(f"  {metric} not in dataset, skipping.")
+                continue
+            if df[metric].isna().all():
+                print(f"  {metric} is entirely NaN, skipping.")
+                continue
+            try:
+                imputer.train(df)
+            except ValueError as e:
+                print(f"  Skipping {metric}: {e}")
+
+    def impute_all(self, df):
+        """Apply all trained imputers sequentially."""
+        for metric, imputer in self.imputers.items():
+            if imputer.is_trained:
+                df = imputer.impute(df)
+        return df
+
+
+if __name__ == "__main__":
+    print("Testing Stage 0 Multi-Metric Imputer...")
+
     modern_data = pd.DataFrame(
         {
             "PLAYER_NAME": ["LeBron", "Curry", "Gobert", "Harden"],
             "PTS": [25.0, 30.0, 15.0, 36.0],
             "AST": [8.0, 6.5, 1.2, 7.5],
             "REB": [8.0, 5.0, 13.0, 6.6],
-            "MIN": [35.0, 34.0, 32.0, 36.5],
+            "MP": [35.0, 34.0, 32.0, 36.5],
             "AGE": [35, 32, 28, 30],
-            "POTENTIAL_AST": [15.2, 12.0, 2.1, 14.8],  # Valid targets
+            "POTENTIAL_AST": [15.2, 12.0, 2.1, 14.8],
+            "PASSES_MADE": [50.1, 42.0, 20.5, 55.3],
         }
     )
 
-    # Simulate some 2005 data (tracking didn't exist, potential assists are NaN)
     retro_data = pd.DataFrame(
         {
             "PLAYER_NAME": ["Nash", "Kobe", "Shaq"],
             "PTS": [15.5, 35.4, 22.9],
-            "AST": [
-                11.5,
-                4.5,
-                2.5,
-            ],  # Nash had huge AST, should predict huge POTENTIAL_AST
+            "AST": [11.5, 4.5, 2.5],
             "REB": [3.3, 5.3, 10.4],
-            "MIN": [34.3, 41.0, 30.0],
+            "MP": [34.3, 41.0, 30.0],
             "AGE": [31, 27, 33],
-            "POTENTIAL_AST": [np.nan, np.nan, np.nan],  # Missing!
+            "POTENTIAL_AST": [np.nan, np.nan, np.nan],
+            "PASSES_MADE": [np.nan, np.nan, np.nan],
         }
     )
 
-    # Combine
     full_dataset = pd.concat([modern_data, retro_data], ignore_index=True)
 
-    # Train imputer
-    imputer = BackcastImputer(target_metric="POTENTIAL_AST")
-    # Use modern data to train since it has the target
-    imputer.train(modern_data)
-
-    # Impute the missing retro data
-    clean_dataset = imputer.impute(full_dataset)
+    multi_imputer = MultiMetricImputer(["POTENTIAL_AST", "PASSES_MADE"])
+    multi_imputer.train_all(full_dataset)
+    clean_dataset = multi_imputer.impute_all(full_dataset)
 
     print("\nResulting Dataset with Imputed Values:")
-    print(clean_dataset[["PLAYER_NAME", "AST", "POTENTIAL_AST"]])
+    print(clean_dataset[["PLAYER_NAME", "AST", "POTENTIAL_AST", "PASSES_MADE"]])
