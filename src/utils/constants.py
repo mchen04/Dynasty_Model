@@ -52,6 +52,7 @@ COLUMN_RENAME_MAP = {
     "USG%": "USG_PCT",
     "FG%": "FG_PCT",
     "3P%": "3P_PCT",
+    "2P%": "2P_PCT",
     "FT%": "FT_PCT",
     "eFG%": "EFG_PCT",
     "ORB%": "ORB_PCT",

@@ -89,6 +89,12 @@ def run():
 
     df_final = pd.concat(network_dfs, ignore_index=True)
 
+    # Drop intermediate pipeline columns
+    pipeline_artifacts = ["TEAM_ID", "PLAYER_ID", "MIN"]
+    df_final = df_final.drop(
+        columns=[c for c in pipeline_artifacts if c in df_final.columns]
+    )
+
     # Save
     import os
     os.makedirs(processed_path.parent, exist_ok=True)

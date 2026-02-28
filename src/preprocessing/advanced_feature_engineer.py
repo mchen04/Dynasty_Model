@@ -230,6 +230,8 @@ def engineer_advanced_features(df):
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("data/raw/historical_nba_dataset.csv")
+    from src.utils.data_loader import load_raw_dataset
+
+    df = load_raw_dataset()
     df = engineer_advanced_features(df)
-    df.to_csv("data/raw/historical_nba_dataset.csv", index=False)
+    df.to_csv("data/processed/historical_nba_dataset_processed.csv", index=False)

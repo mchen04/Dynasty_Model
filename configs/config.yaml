@@ -110,6 +110,12 @@ preprocessing:
     - STL_per100
     - BLK_per100
     - TOV_per100
+    - FGA_per100
+    - FGM_per100
+    - 3PA_per100
+    - 3PM_per100
+    - FTA_per100
+    - FTM_per100
 
   # Imputation targets (tracking stats available 2014+)
   imputation_targets:

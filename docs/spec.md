@@ -64,8 +64,8 @@ Pure math, no ML. Converts projections to dollars/trade values:
 |------|-----|------|-----|------|-----|
 | PTS | +1 | FGM | +2 | FTM | +1 |
 | REB | +1 | FGA | −1 | FTA | −1 |
-| AST | +2 | 3PM | +1 | DD | +2 |
-| STL | +4 | TOV | −2 | TD | +5 |
+| AST | +2 | 3PM | +1 | | |
+| STL | +4 | TOV | −2 | | |
 | BLK | +4 | | | | |
 
 ---
@@ -75,7 +75,7 @@ Pure math, no ML. Converts projections to dollars/trade values:
 | Group | Features |
 |-------|----------|
 | **Box Score** | PTS, REB, AST, STL, BLK, TOV, FGM/A, 3PM/A, FTM/A, MP, G, GS, PF — per-game and per-100 |
-| **Advanced** | PER, TS%, eFG%, BPM/OBPM/DBPM, VORP, WS/OWS/DWS/WS48, USG%, AST%/TOV%/REB%, FTr, 3PAr, EPM (2014+) |
+| **Advanced** | PER, TS%, eFG%, BPM/OBPM/DBPM, VORP, WS/OWS/DWS/WS48, USG%, AST%/TOV%/REB%, FTr, 3PAr |
 | **Era-Adjusted** | Within-season z-scores for all counting stats: `z = (stat − season_mean) / season_std` |
 | **Biometric** | Age, height, weight, wingspan, standing reach, draft year/round/pick, experience, college |
 | **Injury** | Games missed (season-length-aware: 66/73/72 for lockout/bubble/COVID), GP%, rolling 1/2/3-season missed games, injury-prone flag (40+ missed in 3yr) |
