@@ -1,0 +1,7 @@
+pandas
+requests
+beautifulsoup4
+nba_api
+basketball-reference-scraper
+scikit-learn
+torch
