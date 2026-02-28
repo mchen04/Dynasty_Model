@@ -79,18 +79,34 @@ def _train_transformer(
 
     # Simple reconstruction objective: predict last season's stats from sequence
     X_seq = torch.FloatTensor(seq_array)
+    X_seq = torch.nan_to_num(X_seq, nan=0.0)  # replace NaN features for transformer
     masks = torch.BoolTensor(pad_masks)
 
     # Target: last valid timestep features (self-supervised)
+    # Skip all-padded players (no valid positions)
+    target_dim = min(num_features, t_cfg["embedding_dim"])
     targets = []
+    valid_player_indices = []
     for i in range(len(player_ids)):
         valid_positions = ~pad_masks[i]
-        last_valid_idx = np.where(valid_positions)[0][-1]
-        targets.append(seq_array[i, last_valid_idx, :t_cfg["embedding_dim"]])
+        valid_indices = np.where(valid_positions)[0]
+        if len(valid_indices) == 0:
+            continue  # skip all-padded players
+        last_valid_idx = valid_indices[-1]
+        targets.append(seq_array[i, last_valid_idx, :target_dim])
+        valid_player_indices.append(i)
 
-    # Pad/truncate to embedding_dim
-    target_dim = min(num_features, t_cfg["embedding_dim"])
-    y_targets = torch.FloatTensor(np.array([t[:target_dim] for t in targets]))
+    if len(valid_player_indices) == 0:
+        print("    No valid players for transformer training, skipping.")
+        return None, [], []
+
+    # Filter to only valid players
+    valid_player_indices = np.array(valid_player_indices)
+    X_seq = X_seq[valid_player_indices]
+    masks = masks[valid_player_indices]
+    player_ids = [player_ids[i] for i in valid_player_indices]
+
+    y_targets = torch.FloatTensor(np.array(targets))
 
     # Projection from embedding to target reconstruction
     recon_head = nn.Linear(t_cfg["embedding_dim"], target_dim)
@@ -112,6 +128,10 @@ def _train_transformer(
             recon = recon_head(embeddings)
             loss = loss_fn(recon, batch_y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(recon_head.parameters()),
+                max_norm=1.0,
+            )
             optimizer.step()
             total_loss += loss.item()
 
@@ -132,7 +152,7 @@ def _get_transformer_embeddings(model, df, config):
     )
 
     with torch.no_grad():
-        X_seq = torch.FloatTensor(seq_array)
+        X_seq = torch.nan_to_num(torch.FloatTensor(seq_array), nan=0.0)
         masks = torch.BoolTensor(pad_masks)
         embeddings = model(X_seq, src_key_padding_mask=masks)
 
@@ -172,6 +192,142 @@ def _get_versions():
     except Exception:
         pass
     return versions
+
+
+def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
+                     config, max_epochs=100, lr=1e-3):
+    """Train Stage1Ensembler on calibration set using LightGBM preds + transformer embeddings."""
+    target_stats = config["model"]["target_stats"]
+    num_stats = len(target_stats)
+
+    # Get LightGBM T+1 predictions for cal set
+    X_cal = cal_df[feature_cols].values
+    lgbm_preds = pool.predict_all(X_cal)
+
+    # Get transformer embeddings (one per player)
+    cal_embeddings, cal_pids, _ = _get_transformer_embeddings(transformer, cal_df, config)
+    pid_to_emb = {pid: cal_embeddings[i] for i, pid in enumerate(cal_pids)}
+
+    # Match each cal row to its player's embedding
+    cal_player_ids = cal_df["PLAYER_ID"].values
+
+    tree_preds_list = []
+    emb_list = []
+    target_list = []
+
+    for row_idx, pid in enumerate(cal_player_ids):
+        if pid not in pid_to_emb:
+            continue
+
+        tree_pred = []
+        target_vals = []
+        skip = False
+        for stat in target_stats:
+            key = f"{stat}_T+1"
+            if key not in lgbm_preds or key not in pool.pools or not pool.pools[key].is_trained:
+                skip = True
+                break
+            preds = lgbm_preds[key]
+            tree_pred.append([preds["floor"][row_idx], preds["median"][row_idx],
+                              preds["ceiling"][row_idx]])
+            target_vals.append(y_cal_targets.get(key, np.full(len(cal_df), np.nan))[row_idx])
+
+        if skip:
+            continue
+
+        tree_preds_list.append(tree_pred)
+        emb_list.append(pid_to_emb[pid])
+        target_list.append(target_vals)
+
+    if len(tree_preds_list) < 20:
+        print("    Too few matched samples for ensembler training.")
+        return None
+
+    tree_tensor = torch.FloatTensor(np.array(tree_preds_list))   # (n, num_stats, 3)
+    emb_tensor = torch.FloatTensor(np.array(emb_list))           # (n, embedding_dim)
+    target_tensor = torch.FloatTensor(np.array(target_list))     # (n, num_stats)
+
+    ensembler = Stage1Ensembler(num_stats=num_stats)
+    optimizer = torch.optim.AdamW(ensembler.parameters(), lr=lr)
+
+    ensembler.train()
+    for epoch in range(max_epochs):
+        optimizer.zero_grad()
+        output = ensembler(tree_tensor, emb_tensor)  # (n, num_stats, 3)
+
+        # Loss on median predictions, masking NaN targets
+        pred_median = output[:, :, 1]
+        mask = ~torch.isnan(target_tensor)
+        if mask.sum() == 0:
+            break
+        loss = nn.functional.mse_loss(pred_median[mask], target_tensor[mask])
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ensembler.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        if (epoch + 1) % 25 == 0:
+            print(f"    Ensembler epoch {epoch+1}/{max_epochs}, loss: {loss.item():.4f}")
+
+    ensembler.eval()
+    return ensembler
+
+
+def _ensemble_predictions(ensembler, transformer, test_df, feature_cols,
+                          lgbm_preds, config):
+    """Blend T+1 LightGBM predictions with transformer embeddings via ensembler.
+
+    Other horizons pass through unchanged.
+    """
+    target_stats = config["model"]["target_stats"]
+    num_stats = len(target_stats)
+    emb_dim = config["model"]["transformer"]["embedding_dim"]
+
+    # Get transformer embeddings for test set
+    test_embeddings, test_pids, _ = _get_transformer_embeddings(transformer, test_df, config)
+    pid_to_emb = {pid: test_embeddings[i] for i, pid in enumerate(test_pids)}
+
+    test_player_ids = test_df["PLAYER_ID"].values
+    n_rows = len(test_player_ids)
+
+    # Build tree_preds tensor and match embeddings
+    tree_preds = np.zeros((n_rows, num_stats, 3))
+    emb_array = np.zeros((n_rows, emb_dim))
+    has_embedding = np.zeros(n_rows, dtype=bool)
+
+    for stat_idx, stat in enumerate(target_stats):
+        key = f"{stat}_T+1"
+        if key in lgbm_preds:
+            tree_preds[:, stat_idx, 0] = lgbm_preds[key]["floor"]
+            tree_preds[:, stat_idx, 1] = lgbm_preds[key]["median"]
+            tree_preds[:, stat_idx, 2] = lgbm_preds[key]["ceiling"]
+
+    for row_idx, pid in enumerate(test_player_ids):
+        if pid in pid_to_emb:
+            emb_array[row_idx] = pid_to_emb[pid]
+            has_embedding[row_idx] = True
+
+    if has_embedding.sum() == 0:
+        return lgbm_preds
+
+    with torch.no_grad():
+        tree_tensor = torch.FloatTensor(tree_preds[has_embedding])
+        emb_tensor = torch.FloatTensor(emb_array[has_embedding])
+        ensembled = ensembler(tree_tensor, emb_tensor).numpy()  # (n_matched, num_stats, 3)
+
+    # Write ensembled T+1 predictions back
+    ensembled_preds = {}
+    for key, val in lgbm_preds.items():
+        ensembled_preds[key] = {k: v.copy() for k, v in val.items()}
+
+    for stat_idx, stat in enumerate(target_stats):
+        key = f"{stat}_T+1"
+        if key not in ensembled_preds:
+            continue
+        ensembled_preds[key]["floor"][has_embedding] = ensembled[:, stat_idx, 0]
+        ensembled_preds[key]["median"][has_embedding] = ensembled[:, stat_idx, 1]
+        ensembled_preds[key]["ceiling"][has_embedding] = ensembled[:, stat_idx, 2]
+
+    return ensembled_preds
 
 
 def run_training(save_artifacts=False, artifact_dir="artifacts"):
@@ -256,6 +412,11 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
                     y_cal_targets[key] = cal_df[key].values
                     y_test_targets[key] = test_df[key].values
 
+        # Compute sample weights from games played
+        fit_weights = None
+        if "G" in fit_df.columns:
+            fit_weights = np.clip(fit_df["G"].values / 82.0, 0.1, 1.0)
+
         # 1. Train MultiTargetQuantilePool
         print("  Training quantile regressors...")
         pool = MultiTargetQuantilePool()
@@ -264,7 +425,7 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
         tune = (test_year == start_test_year)
         if tune:
             print("  (Tuning hyperparameters on first fold...)")
-        pool.fit_all(X_fit, y_fit_targets, tune_first_only=tune)
+        pool.fit_all(X_fit, y_fit_targets, tune_first_only=tune, sample_weight=fit_weights)
 
         # 2. Calibrate with MAPIE
         print("  Calibrating with MAPIE...")
@@ -280,6 +441,17 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
         except Exception as e:
             print(f"  Transformer training failed: {e}")
 
+        # 4. Train ensembler on calibration set
+        ensembler = None
+        if transformer is not None:
+            print("  Training ensembler...")
+            try:
+                ensembler = _train_ensembler(
+                    transformer, pool, cal_df, feature_cols, y_cal_targets, config
+                )
+            except Exception as e:
+                print(f"  Ensembler training failed: {e}")
+
         # Save fold artifacts
         if save_artifacts:
             fold_dir = os.path.join(artifact_dir, "models", f"fold_{test_year}")
@@ -288,18 +460,38 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
             pool.save_all(fold_dir)
             if transformer is not None:
                 transformer.save(os.path.join(fold_dir, "transformer.pt"))
+            if ensembler is not None:
+                ensembler.save(os.path.join(fold_dir, "ensembler.pt"))
 
-        # 4. Predict and evaluate on test set
+        # 5. Predict on test set (LightGBM baseline)
         all_preds = pool.predict_all(X_test)
 
-        # Evaluate T+1 predictions for key stats
+        # Ensemble T+1 predictions if ensembler available
+        if ensembler is not None:
+            print("  Ensembling predictions...")
+            try:
+                all_preds = _ensemble_predictions(
+                    ensembler, transformer, test_df, feature_cols, all_preds, config
+                )
+            except Exception as e:
+                print(f"  Ensemble prediction failed, using LightGBM only: {e}")
+
+        # 6. Evaluate — all 14 stats at T+1, key stats at T+2 and T+3
         year_metrics = {"year": test_year}
-        for stat in ["PTS", "REB", "AST", "MP"]:
-            key = f"{stat}_T+1"
+
+        # All stats at T+1
+        eval_pairs = [(stat, 1) for stat in config["model"]["target_stats"]]
+        # Key stats at longer horizons
+        eval_pairs += [(stat, h) for stat in ["PTS", "REB", "AST", "MP"] for h in [2, 3]]
+
+        key_print_stats = {"PTS", "REB", "AST", "MP", "STL", "BLK", "TOV"}
+        for stat, h in eval_pairs:
+            key = f"{stat}_T+{h}"
             if key in all_preds and key in y_test_targets:
                 preds = all_preds[key]
                 y_true = y_test_targets[key]
-                valid = ~np.isnan(y_true)
+                y_pred_median = preds["median"]
+                valid = ~np.isnan(y_true) & ~np.isnan(y_pred_median)
 
                 if valid.sum() > 0:
                     rmse = np.sqrt(mean_squared_error(y_true[valid], preds["median"][valid]))
@@ -307,13 +499,15 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
                     above_floor = np.mean(y_true[valid] >= preds["floor"][valid]) * 100
                     below_ceil = np.mean(y_true[valid] <= preds["ceiling"][valid]) * 100
 
-                    year_metrics[f"{stat}_RMSE"] = rmse
-                    year_metrics[f"{stat}_MAE"] = mae
-                    year_metrics[f"{stat}_floor_cal"] = above_floor
-                    year_metrics[f"{stat}_ceil_cal"] = below_ceil
+                    year_metrics[f"{stat}_T+{h}_RMSE"] = rmse
+                    year_metrics[f"{stat}_T+{h}_MAE"] = mae
+                    year_metrics[f"{stat}_T+{h}_floor_cal"] = above_floor
+                    year_metrics[f"{stat}_T+{h}_ceil_cal"] = below_ceil
 
-                    print(f"    {stat} T+1: RMSE={rmse:.2f}, MAE={mae:.2f}, "
-                          f"Floor Cal={above_floor:.1f}%, Ceil Cal={below_ceil:.1f}%")
+                    # Only print key stats to avoid log spam
+                    if stat in key_print_stats and h == 1:
+                        print(f"    {stat} T+{h}: RMSE={rmse:.2f}, MAE={mae:.2f}, "
+                              f"Floor Cal={above_floor:.1f}%, Ceil Cal={below_ceil:.1f}%")
 
         all_metrics.append(year_metrics)
 
@@ -321,12 +515,29 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
     print("\n--- Walk-Forward Validation Complete ---")
     if all_metrics:
         metrics_df = pd.DataFrame(all_metrics)
-        for stat in ["PTS", "REB", "AST", "MP"]:
-            rmse_col = f"{stat}_RMSE"
+
+        # Print key stats summary at T+1
+        print("\n  T+1 Averages:")
+        for stat in config["model"]["target_stats"]:
+            rmse_col = f"{stat}_T+1_RMSE"
             if rmse_col in metrics_df.columns:
-                print(f"  {stat} T+1 Average RMSE: {metrics_df[rmse_col].mean():.2f}")
-                print(f"  {stat} T+1 Average Floor Cal: {metrics_df[f'{stat}_floor_cal'].mean():.1f}%")
-                print(f"  {stat} T+1 Average Ceil Cal: {metrics_df[f'{stat}_ceil_cal'].mean():.1f}%")
+                avg_rmse = metrics_df[rmse_col].mean()
+                avg_floor = metrics_df[f"{stat}_T+1_floor_cal"].mean()
+                avg_ceil = metrics_df[f"{stat}_T+1_ceil_cal"].mean()
+                print(f"    {stat:>3s}: RMSE={avg_rmse:.2f}, "
+                      f"Floor Cal={avg_floor:.1f}%, Ceil Cal={avg_ceil:.1f}%")
+
+        # Print longer-horizon summary for key stats
+        for h in [2, 3]:
+            has_any = False
+            for stat in ["PTS", "REB", "AST", "MP"]:
+                rmse_col = f"{stat}_T+{h}_RMSE"
+                if rmse_col in metrics_df.columns:
+                    if not has_any:
+                        print(f"\n  T+{h} Averages:")
+                        has_any = True
+                    avg_rmse = metrics_df[rmse_col].mean()
+                    print(f"    {stat:>3s}: RMSE={avg_rmse:.2f}")
 
     # Save metrics and metadata
     if save_artifacts:

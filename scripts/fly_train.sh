@@ -13,7 +13,7 @@ set -euo pipefail
 APP_NAME="dynasty-model-train"
 REGION="sjc"
 VOLUME_NAME="model_artifacts"
-VOLUME_SIZE_GB=1
+VOLUME_SIZE_GB=5
 LOCAL_ARTIFACT_DIR="./artifacts"
 LOG_FILE="./artifacts/training.log"
 

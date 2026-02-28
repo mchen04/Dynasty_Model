@@ -68,10 +68,11 @@ class QuantileRegressorPool:
         self._best_params = study.best_params
         return self._best_params
 
-    def fit(self, X_train, y_train, params=None):
+    def fit(self, X_train, y_train, params=None, sample_weight=None):
         """
-        Train floor/median/ceiling LightGBM quantile regressors.
+        Train floor/median/ceiling LightGBM quantile regressors with early stopping.
         """
+        import lightgbm as lgb
         from lightgbm import LGBMRegressor
 
         config = load_config()
@@ -84,12 +85,30 @@ class QuantileRegressorPool:
 
         print(f"  Training quantile models for {self.target_name} T+{self.horizon}...")
 
+        # Hold out last 10% for early stopping
+        split_idx = int(len(X_train) * 0.9)
+        X_fit, X_val = X_train[:split_idx], X_train[split_idx:]
+        y_fit, y_val = y_train[:split_idx], y_train[split_idx:]
+        w_fit = sample_weight[:split_idx] if sample_weight is not None else None
+        w_val = sample_weight[split_idx:] if sample_weight is not None else None
+
+        # Use high n_estimators cap with early stopping
+        fit_params = {k: v for k, v in params.items() if k != "n_estimators"}
+        n_estimators = max(params.get("n_estimators", 500), 1000)
+
         labels = ["floor", "median", "ceiling"]
         for alpha, label in zip(alphas, labels):
             model = LGBMRegressor(
-                objective="quantile", alpha=alpha, verbose=-1, **params
+                objective="quantile", alpha=alpha, verbose=-1,
+                n_estimators=n_estimators, **fit_params,
             )
-            model.fit(X_train, y_train)
+            model.fit(
+                X_fit, y_fit,
+                sample_weight=w_fit,
+                eval_set=[(X_val, y_val)],
+                eval_sample_weight=[w_val] if w_val is not None else None,
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
             self.models[label] = model
 
         self.is_trained = True
@@ -210,12 +229,26 @@ class MultiTargetQuantilePool:
                 key = f"{stat}_T+{h}"
                 self.pools[key] = QuantileRegressorPool(target_name=stat, horizon=h)
 
-    def fit_all(self, X_train, y_targets, tune_first_only=True):
+    # Per-stat-group Optuna tuning: different distributions need different tree structures
+    STAT_GROUPS = {
+        "counting": ["PTS", "REB", "AST", "FGM", "FGA", "FTM", "FTA", "3PM", "3PA"],
+        "rate": ["MP", "G"],
+        "defense": ["STL", "BLK", "TOV"],
+    }
+
+    def _get_stat_group(self, stat):
+        """Return the group name for a stat."""
+        for group, stats in self.STAT_GROUPS.items():
+            if stat in stats:
+                return group
+        return "counting"  # fallback
+
+    def fit_all(self, X_train, y_targets, tune_first_only=True, sample_weight=None):
         """
         Train all pools. y_targets is a dict mapping 'STAT_T+H' -> target array.
-        If tune_first_only, Optuna tuning runs on the first pool and params are reused.
+        If tune_first_only, tunes one representative stat per group and reuses params.
         """
-        shared_params = None
+        group_params = {}  # group_name -> best_params
 
         for key, pool in self.pools.items():
             if key not in y_targets:
@@ -229,12 +262,16 @@ class MultiTargetQuantilePool:
 
             X_valid = X_train[valid]
             y_valid = y[valid]
+            w_valid = sample_weight[valid] if sample_weight is not None else None
 
-            if tune_first_only and shared_params is None:
-                print(f"  Tuning hyperparams on {key}...")
-                shared_params = pool.tune_hyperparams(X_valid, y_valid)
+            group = self._get_stat_group(pool.target_name)
 
-            pool.fit(X_valid, y_valid, params=shared_params)
+            if tune_first_only and group not in group_params:
+                print(f"  Tuning hyperparams for '{group}' group on {key}...")
+                group_params[group] = pool.tune_hyperparams(X_valid, y_valid)
+
+            params = group_params.get(group)
+            pool.fit(X_valid, y_valid, params=params, sample_weight=w_valid)
 
     def calibrate_all(self, X_cal, y_cal_targets):
         """Calibrate all trained pools with MAPIE."""

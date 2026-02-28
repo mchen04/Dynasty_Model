@@ -23,11 +23,11 @@ Predicts floor (10th), median (50th), and ceiling (90th) percentile outcomes for
 - **Efficiency**: PTS, REB, AST, STL, BLK, TOV, FGM, FGA, FTM, FTA, 3PM, 3PA
 - **Opportunity**: MP, G
 
-**LightGBM quantile regressors** handle the cross-sectional snapshot (210 models: 14 stats × 5 horizons × 3 quantiles). Tuned via Optuna with TimeSeriesSplit CV, calibrated with MAPIE for guaranteed coverage intervals. NaN-native — no zero-filling.
+**LightGBM quantile regressors** handle the cross-sectional snapshot (210 models: 14 stats × 5 horizons × 3 quantiles). Per-stat-group Optuna tuning (counting / rate / defense stats tuned separately), early stopping (50-round patience against 10% holdout), and games-played sample weighting. Calibrated with MAPIE for guaranteed coverage intervals. NaN-native — no zero-filling.
 
-**Time-Series Transformer** (4-head, 2-layer, GELU, 64-dim) processes career sequences via self-attention, outputting a trajectory embedding that captures breakouts and decline.
+**Time-Series Transformer** (4-head, 2-layer, GELU, 64-dim) processes career sequences via self-attention, outputting a trajectory embedding that captures breakouts and decline. NaN-safe (nan_to_num on inputs, gradient clipping, all-padded player filtering).
 
-**Ensembler** blends tree predictions with trajectory corrections via per-stat learned alpha weights and an adjustment MLP. Monotonicity enforcement (sort) guarantees floor ≤ median ≤ ceiling.
+**Ensembler** blends T+1 tree predictions with trajectory corrections via per-stat learned alpha weights and an adjustment MLP. Trained on calibration set to learn optimal blending. Monotonicity enforcement (sort) guarantees floor ≤ median ≤ ceiling. Longer horizons (T+2–T+5) use LightGBM-only predictions.
 
 ### Stage 2 — Valuation Layer (League-Specific)
 
@@ -91,7 +91,7 @@ Pure math, no ML. Converts projections to dollars/trade values:
 
 **Data**: 2001-02 to present ("Modern NBA" — zone defense legalized). All players included regardless of minutes to prevent survivorship bias.
 
-**Walk-forward CV**: For each test year, train on all prior seasons. Fit/calibration split within training data (last 15% of seasons held for MAPIE calibration). Optuna tuning on first fold only, params reused.
+**Walk-forward CV**: For each test year, train on all prior seasons. Fit/calibration split within training data (last 15% of seasons held for MAPIE calibration). Per-stat-group Optuna tuning on first fold only (3 groups: counting, rate, defense), params reused within group across folds.
 
 **Targets**: NaN left as NaN (career endings are structurally informative). LightGBM handles natively; transformer uses padding masks.
 
@@ -100,6 +100,7 @@ Pure math, no ML. Converts projections to dollars/trade values:
 ## Evaluation
 
 - **Quantile calibration**: ~80% of actuals within floor–ceiling, per stat and horizon
+- **Full evaluation**: All 14 stats at T+1, key stats (PTS/REB/AST/MP) at T+2 and T+3
 - **Dynasty backtesting**: Spearman rank correlation (predicted dynasty value vs realized 3yr FPTS), RMSE, top-30 hit rate (% in actual top-50)
 - **Trade decisions**: Pairwise accuracy on similarly-valued players (within 30%) — did the model correctly identify who produced more?
 
@@ -133,10 +134,11 @@ Dynasty_Model/
 │   │   ├── network_effects.py
 │   │   └── sequence_builder.py
 │   ├── models/
-│   │   ├── train.py               # Walk-forward CV
-│   │   ├── quantile_regressor.py  # LightGBM + MAPIE
+│   │   ├── train.py               # Walk-forward CV, ensembler integration
+│   │   ├── quantile_regressor.py  # LightGBM + MAPIE + early stopping
 │   │   ├── transformer.py
-│   │   └── ensembler.py
+│   │   ├── ensembler.py
+│   │   └── serialization.py       # Model saving/loading utilities
 │   ├── valuation/
 │   │   └── vorp_calculator.py     # DynastyValuationEngine
 │   └── evaluation/
