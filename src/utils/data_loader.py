@@ -5,6 +5,14 @@ import pandas as pd
 from src.utils.config import load_config, resolve_path
 from src.utils.constants import COLUMN_RENAME_MAP, COLUMNS_TO_DROP
 
+# Columns that should be numeric but may contain text (e.g., "Undrafted", " ")
+COERCE_NUMERIC_COLS = [
+    "PLAYER_WEIGHT",
+    "DRAFT_YEAR",
+    "DRAFT_ROUND",
+    "DRAFT_NUMBER",
+]
+
 
 def load_raw_dataset(path=None):
     """
@@ -15,7 +23,7 @@ def load_raw_dataset(path=None):
         config = load_config()
         path = resolve_path(config["project"]["raw_data"])
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, low_memory=False)
 
     # Filter out League Average rows
     if "Player" in df.columns:
@@ -30,6 +38,11 @@ def load_raw_dataset(path=None):
     rename_map = {k: v for k, v in COLUMN_RENAME_MAP.items() if k in df.columns}
     if rename_map:
         df = df.rename(columns=rename_map)
+
+    # Coerce mixed-type columns to numeric (e.g., "Undrafted" → NaN)
+    for col in COERCE_NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Drop duplicates from same-name player collisions in bio merge
     # (e.g., two "Marcus Williams" or "Tony Mitchell" in same season)
