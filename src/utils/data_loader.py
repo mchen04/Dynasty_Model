@@ -31,6 +31,10 @@ def load_raw_dataset(path=None):
     if rename_map:
         df = df.rename(columns=rename_map)
 
+    # Drop duplicates from same-name player collisions in bio merge
+    # (e.g., two "Marcus Williams" or "Tony Mitchell" in same season)
+    df = df.drop_duplicates(subset=["Player", "SEASON", "TEAM"], keep="first")
+
     return df
 
 

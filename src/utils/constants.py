@@ -68,6 +68,12 @@ COLUMN_RENAME_MAP = {
     "FT_per100": "FTM_per100",
     "3P_per100": "3PM_per100",
     "TRB_per100": "REB_per100",
+    # Per-100 percentage renames
+    "FG%_per100": "FG_PCT_per100",
+    "3P%_per100": "3P_PCT_per100",
+    "2P%_per100": "2P_PCT_per100",
+    "eFG%_per100": "EFG_PCT_per100",
+    "FT%_per100": "FT_PCT_per100",
 }
 
 # Columns to drop at load time (ranking artifacts, awards)
