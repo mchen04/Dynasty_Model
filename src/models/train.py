@@ -66,9 +66,9 @@ def _train_transformer(
     """Train the time-series transformer on player sequences."""
     t_cfg = config["model"]["transformer"]
 
-    # Build sequences
+    # Build sequences — pass feature_cols to avoid target-column leakage
     seq_array, pad_masks, seq_feat_cols, player_ids, row_map = build_player_sequences(
-        df_train, max_seq_length=t_cfg["max_seq_len"]
+        df_train, max_seq_length=t_cfg["max_seq_len"], feature_cols=feature_cols,
     )
 
     num_features = seq_array.shape[2]
@@ -80,20 +80,32 @@ def _train_transformer(
     # Simple reconstruction objective: predict last season's stats from sequence
     X_seq = torch.FloatTensor(seq_array)
     X_seq = torch.nan_to_num(X_seq, nan=0.0)  # replace NaN features for transformer
+
+    # Standardize features to prevent gradient explosion (compute from valid positions)
+    valid_positions = ~torch.BoolTensor(pad_masks)  # True = valid
+    flat_valid = X_seq[valid_positions]  # (total_valid_timesteps, num_features)
+    feat_mean = flat_valid.mean(dim=0)
+    feat_std = flat_valid.std(dim=0).clamp(min=1e-6)
+    X_seq = (X_seq - feat_mean) / feat_std
+
     masks = torch.BoolTensor(pad_masks)
 
-    # Target: last valid timestep features (self-supervised)
+    # Target: last valid timestep features (self-supervised, also standardized)
     # Skip all-padded players (no valid positions)
     target_dim = min(num_features, t_cfg["embedding_dim"])
     targets = []
     valid_player_indices = []
     for i in range(len(player_ids)):
-        valid_positions = ~pad_masks[i]
-        valid_indices = np.where(valid_positions)[0]
+        valid_pos = ~pad_masks[i]
+        valid_indices = np.where(valid_pos)[0]
         if len(valid_indices) == 0:
             continue  # skip all-padded players
         last_valid_idx = valid_indices[-1]
-        targets.append(seq_array[i, last_valid_idx, :target_dim])
+        # Use standardized values for targets to match input scale
+        raw = torch.FloatTensor(seq_array[i, last_valid_idx, :target_dim])
+        raw = torch.nan_to_num(raw, nan=0.0)
+        standardized = (raw - feat_mean[:target_dim]) / feat_std[:target_dim]
+        targets.append(standardized.numpy())
         valid_player_indices.append(i)
 
     if len(valid_player_indices) == 0:
@@ -140,19 +152,32 @@ def _train_transformer(
             print(f"    Transformer epoch {epoch+1}/{max_epochs}, loss: {avg_loss:.4f}")
 
     model.eval()
-    return model, seq_feat_cols, player_ids
+    return model, seq_feat_cols, player_ids, (feat_mean, feat_std)
 
 
-def _get_transformer_embeddings(model, df, config):
-    """Extract transformer embeddings for all players in df."""
+def _get_transformer_embeddings(model, df, config, feature_cols=None,
+                                norm_stats=None):
+    """Extract transformer embeddings for all players in df.
+
+    Uses the full player history present in *df* to build multi-season
+    sequences.  Callers should pass a context DataFrame that includes all
+    seasons up to (and including) the target season so that each player gets
+    their complete career trajectory, not just one season.
+
+    norm_stats: (feat_mean, feat_std) tensors from training, used to apply
+    the same standardization.
+    """
     t_cfg = config["model"]["transformer"]
 
     seq_array, pad_masks, feat_cols, player_ids, row_map = build_player_sequences(
-        df, max_seq_length=t_cfg["max_seq_len"]
+        df, max_seq_length=t_cfg["max_seq_len"], feature_cols=feature_cols,
     )
 
     with torch.no_grad():
         X_seq = torch.nan_to_num(torch.FloatTensor(seq_array), nan=0.0)
+        if norm_stats is not None:
+            feat_mean, feat_std = norm_stats
+            X_seq = (X_seq - feat_mean) / feat_std
         masks = torch.BoolTensor(pad_masks)
         embeddings = model(X_seq, src_key_padding_mask=masks)
 
@@ -195,8 +220,14 @@ def _get_versions():
 
 
 def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
-                     config, max_epochs=100, lr=1e-3):
-    """Train Stage1Ensembler on calibration set using LightGBM preds + transformer embeddings."""
+                     config, context_df=None, norm_stats=None,
+                     max_epochs=100, lr=1e-3):
+    """Train Stage1Ensembler on calibration set using LightGBM preds + transformer embeddings.
+
+    context_df: full history DataFrame (all seasons up to cal) so the
+    transformer gets multi-season sequences for each player.
+    norm_stats: (feat_mean, feat_std) from transformer training.
+    """
     target_stats = config["model"]["target_stats"]
     num_stats = len(target_stats)
 
@@ -204,8 +235,12 @@ def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
     X_cal = cal_df[feature_cols].values
     lgbm_preds = pool.predict_all(X_cal)
 
-    # Get transformer embeddings (one per player)
-    cal_embeddings, cal_pids, _ = _get_transformer_embeddings(transformer, cal_df, config)
+    # Get transformer embeddings using full history (one per player)
+    emb_df = context_df if context_df is not None else cal_df
+    cal_embeddings, cal_pids, _ = _get_transformer_embeddings(
+        transformer, emb_df, config, feature_cols=feature_cols,
+        norm_stats=norm_stats,
+    )
     pid_to_emb = {pid: cal_embeddings[i] for i, pid in enumerate(cal_pids)}
 
     # Match each cal row to its player's embedding
@@ -273,17 +308,33 @@ def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
 
 
 def _ensemble_predictions(ensembler, transformer, test_df, feature_cols,
-                          lgbm_preds, config):
+                          lgbm_preds, config, context_df=None,
+                          norm_stats=None):
     """Blend T+1 LightGBM predictions with transformer embeddings via ensembler.
 
     Other horizons pass through unchanged.
+
+    context_df: full history DataFrame (all seasons up to test year) so the
+    transformer gets multi-season sequences.
+    norm_stats: (feat_mean, feat_std) from transformer training.
     """
     target_stats = config["model"]["target_stats"]
     num_stats = len(target_stats)
     emb_dim = config["model"]["transformer"]["embedding_dim"]
 
-    # Get transformer embeddings for test set
-    test_embeddings, test_pids, _ = _get_transformer_embeddings(transformer, test_df, config)
+    # Get transformer embeddings using full history
+    emb_df = context_df if context_df is not None else test_df
+    test_embeddings, test_pids, _ = _get_transformer_embeddings(
+        transformer, emb_df, config, feature_cols=feature_cols,
+        norm_stats=norm_stats,
+    )
+
+    # NaN guard: if embeddings are bad, fall back to LightGBM
+    if np.isnan(test_embeddings).any():
+        nan_pct = np.isnan(test_embeddings).mean() * 100
+        print(f"  WARNING: {nan_pct:.0f}% NaN in transformer embeddings, using LightGBM only")
+        return lgbm_preds
+
     pid_to_emb = {pid: test_embeddings[i] for i, pid in enumerate(test_pids)}
 
     test_player_ids = test_df["PLAYER_ID"].values
@@ -431,23 +482,25 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
         print("  Calibrating with MAPIE...")
         pool.calibrate_all(X_cal, y_cal_targets)
 
-        # 3. Train transformer
+        # 3. Train transformer on full training history
         print("  Training transformer...")
         transformer = None
+        norm_stats = None
         try:
-            transformer, seq_feats, train_pids = _train_transformer(
-                fit_df, feature_cols, config, max_epochs=30
+            transformer, seq_feats, train_pids, norm_stats = _train_transformer(
+                train_df, feature_cols, config, max_epochs=30
             )
         except Exception as e:
             print(f"  Transformer training failed: {e}")
 
-        # 4. Train ensembler on calibration set
+        # 4. Train ensembler on calibration set (full train history for embeddings)
         ensembler = None
         if transformer is not None:
             print("  Training ensembler...")
             try:
                 ensembler = _train_ensembler(
-                    transformer, pool, cal_df, feature_cols, y_cal_targets, config
+                    transformer, pool, cal_df, feature_cols, y_cal_targets, config,
+                    context_df=train_df, norm_stats=norm_stats,
                 )
             except Exception as e:
                 print(f"  Ensembler training failed: {e}")
@@ -460,6 +513,11 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
             pool.save_all(fold_dir)
             if transformer is not None:
                 transformer.save(os.path.join(fold_dir, "transformer.pt"))
+                if norm_stats is not None:
+                    torch.save(
+                        {"mean": norm_stats[0], "std": norm_stats[1]},
+                        os.path.join(fold_dir, "norm_stats.pt"),
+                    )
             if ensembler is not None:
                 ensembler.save(os.path.join(fold_dir, "ensembler.pt"))
 
@@ -469,9 +527,12 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
         # Ensemble T+1 predictions if ensembler available
         if ensembler is not None:
             print("  Ensembling predictions...")
+            # Use all data up to and including test year for full player histories
+            context_df = df[df["SEASON"] <= test_year].copy()
             try:
                 all_preds = _ensemble_predictions(
-                    ensembler, transformer, test_df, feature_cols, all_preds, config
+                    ensembler, transformer, test_df, feature_cols, all_preds, config,
+                    context_df=context_df, norm_stats=norm_stats,
                 )
             except Exception as e:
                 print(f"  Ensemble prediction failed, using LightGBM only: {e}")

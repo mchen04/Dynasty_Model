@@ -117,18 +117,33 @@ class QuantileRegressorPool:
     def calibrate(self, X_cal, y_cal):
         """Wrap with MAPIE for guaranteed coverage intervals."""
         try:
-            from mapie.quantile_regression import MapieQuantileRegressor
+            # MAPIE >=1.0: ConformalizedQuantileRegressor + conformalize()
+            # MAPIE <1.0:  MapieQuantileRegressor + fit()
+            try:
+                from mapie.regression import ConformalizedQuantileRegressor as _CQR
+                mapie = _CQR(
+                    estimator=[
+                        self.models["floor"],
+                        self.models["median"],
+                        self.models["ceiling"],
+                    ],
+                    prefit=True,
+                    confidence_level=0.8,  # 80% coverage target
+                )
+                mapie.conformalize(X_cal, y_cal)
+            except ImportError:
+                from mapie.quantile_regression import MapieQuantileRegressor as _CQR
+                mapie = _CQR(
+                    estimator=[
+                        self.models["floor"],
+                        self.models["median"],
+                        self.models["ceiling"],
+                    ],
+                    cv="prefit",
+                    alpha=0.2,
+                )
+                mapie.fit(X_cal, y_cal)
 
-            mapie = MapieQuantileRegressor(
-                estimator=[
-                    self.models["floor"],
-                    self.models["median"],
-                    self.models["ceiling"],
-                ],
-                cv="prefit",
-                alpha=0.2,  # 80% coverage target
-            )
-            mapie.fit(X_cal, y_cal)
             self.calibrated_models["mapie"] = mapie
             self.is_calibrated = True
             print(f"  Calibrated {self.target_name} T+{self.horizon} with MAPIE.")
@@ -144,7 +159,12 @@ class QuantileRegressorPool:
 
         if self.is_calibrated and "mapie" in self.calibrated_models:
             mapie = self.calibrated_models["mapie"]
-            y_pred, y_pis = mapie.predict(X_test)
+            # MAPIE >=1.0: predict() returns median, predict_interval() returns (median, pis)
+            # MAPIE <1.0:  predict() returns (median, pis)
+            if hasattr(mapie, "predict_interval"):
+                y_pred, y_pis = mapie.predict_interval(X_test)
+            else:
+                y_pred, y_pis = mapie.predict(X_test)
             return {
                 "floor": y_pis[:, 0, 0],
                 "median": y_pred,

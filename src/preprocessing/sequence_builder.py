@@ -3,11 +3,16 @@ import pandas as pd
 
 
 def build_player_sequences(
-    df, player_id_col="PLAYER_ID", season_col="SEASON", max_seq_length=15
+    df, player_id_col="PLAYER_ID", season_col="SEASON", max_seq_length=15,
+    feature_cols=None,
 ):
     """
     Transforms flattened cross-sectional data into padded sequences
     [Batch, Seq_Len, Features] for the Time-Series Transformer.
+
+    Args:
+        feature_cols: explicit list of columns to use. When provided, only these
+            columns appear in the sequence tensor (avoids target-column leakage).
 
     Returns:
         sequence_array: (Num_Players, Max_Seq_Len, Num_Features) numpy array
@@ -20,8 +25,9 @@ def build_player_sequences(
 
     df = df.sort_values(by=[player_id_col, season_col]).reset_index(drop=True)
 
-    exclude_cols = [player_id_col, season_col, "PLAYER_NAME", "TEAM_ID", "Player", "TEAM", "Tm"]
-    feature_cols = [c for c in df.columns if c not in exclude_cols and df[c].dtype in [np.float64, np.int64, float, int]]
+    if feature_cols is None:
+        exclude_cols = [player_id_col, season_col, "PLAYER_NAME", "TEAM_ID", "Player", "TEAM", "Tm"]
+        feature_cols = [c for c in df.columns if c not in exclude_cols and df[c].dtype in [np.float64, np.int64, float, int]]
 
     sequences = []
     masks = []
