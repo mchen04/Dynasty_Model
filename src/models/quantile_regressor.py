@@ -263,12 +263,18 @@ class MultiTargetQuantilePool:
                 return group
         return "counting"  # fallback
 
-    def fit_all(self, X_train, y_targets, tune_first_only=True, sample_weight=None):
+    def fit_all(self, X_train, y_targets, tune_first_only=True,
+                sample_weight=None, group_params=None):
         """
         Train all pools. y_targets is a dict mapping 'STAT_T+H' -> target array.
         If tune_first_only, tunes one representative stat per group and reuses params.
+
+        group_params: optional dict of pre-tuned {group_name: params} from a
+        previous fold. When provided, skips tuning and uses these directly.
+        Returns the group_params dict so callers can persist it across folds.
         """
-        group_params = {}  # group_name -> best_params
+        if group_params is None:
+            group_params = {}
 
         for key, pool in self.pools.items():
             if key not in y_targets:
@@ -292,6 +298,8 @@ class MultiTargetQuantilePool:
 
             params = group_params.get(group)
             pool.fit(X_valid, y_valid, params=params, sample_weight=w_valid)
+
+        return group_params
 
     def calibrate_all(self, X_cal, y_cal_targets):
         """Calibrate all trained pools with MAPIE."""

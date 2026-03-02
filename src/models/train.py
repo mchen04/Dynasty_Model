@@ -221,7 +221,7 @@ def _get_versions():
 
 def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
                      config, context_df=None, norm_stats=None,
-                     max_epochs=100, lr=1e-3):
+                     max_epochs=300, lr=1e-3, patience=30):
     """Train Stage1Ensembler on calibration set using LightGBM preds + transformer embeddings.
 
     context_df: full history DataFrame (all seasons up to cal) so the
@@ -286,6 +286,10 @@ def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
     optimizer = torch.optim.AdamW(ensembler.parameters(), lr=lr)
 
     ensembler.train()
+    best_loss = float("inf")
+    epochs_no_improve = 0
+    best_state = None
+
     for epoch in range(max_epochs):
         optimizer.zero_grad()
         output = ensembler(tree_tensor, emb_tensor)  # (n, num_stats, 3)
@@ -300,9 +304,23 @@ def _train_ensembler(transformer, pool, cal_df, feature_cols, y_cal_targets,
         torch.nn.utils.clip_grad_norm_(ensembler.parameters(), max_norm=1.0)
         optimizer.step()
 
-        if (epoch + 1) % 25 == 0:
-            print(f"    Ensembler epoch {epoch+1}/{max_epochs}, loss: {loss.item():.4f}")
+        current_loss = loss.item()
+        if current_loss < best_loss - 1e-4:
+            best_loss = current_loss
+            best_state = {k: v.clone() for k, v in ensembler.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
+        if (epoch + 1) % 50 == 0:
+            print(f"    Ensembler epoch {epoch+1}/{max_epochs}, loss: {current_loss:.4f}")
+
+        if epochs_no_improve >= patience:
+            print(f"    Ensembler early stop at epoch {epoch+1}, best loss: {best_loss:.4f}")
+            break
+
+    if best_state is not None:
+        ensembler.load_state_dict(best_state)
     ensembler.eval()
     return ensembler
 
@@ -422,6 +440,7 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
     print(f"\n--- Walk-Forward Validation (Testing {start_test_year} to {max_year}) ---")
 
     all_metrics = []
+    tuned_group_params = None  # persisted across folds
 
     for test_year in range(start_test_year, max_year + 1):
         print(f"\n=== Evaluating Season: {test_year} ===")
@@ -439,8 +458,8 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
         cal_seasons = train_seasons[-cal_split:]
         fit_seasons = train_seasons[:-cal_split]
 
-        fit_df = train_df[train_df["SEASON"].isin(fit_seasons)]
-        cal_df = train_df[train_df["SEASON"].isin(cal_seasons)]
+        fit_df = train_df[train_df["SEASON"].isin(fit_seasons)].sort_values("SEASON")
+        cal_df = train_df[train_df["SEASON"].isin(cal_seasons)].sort_values("SEASON")
 
         print(f"  Fit: {len(fit_df)} rows ({len(fit_seasons)} seasons)")
         print(f"  Cal: {len(cal_df)} rows ({len(cal_seasons)} seasons)")
@@ -472,11 +491,14 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
         print("  Training quantile regressors...")
         pool = MultiTargetQuantilePool()
 
-        # Optuna tuning on first fold only
+        # Optuna tuning on first fold only, reuse params on subsequent folds
         tune = (test_year == start_test_year)
         if tune:
             print("  (Tuning hyperparameters on first fold...)")
-        pool.fit_all(X_fit, y_fit_targets, tune_first_only=tune, sample_weight=fit_weights)
+        tuned_group_params = pool.fit_all(
+            X_fit, y_fit_targets, tune_first_only=tune,
+            sample_weight=fit_weights, group_params=tuned_group_params,
+        )
 
         # 2. Calibrate with MAPIE
         print("  Calibrating with MAPIE...")
@@ -537,13 +559,14 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
             except Exception as e:
                 print(f"  Ensemble prediction failed, using LightGBM only: {e}")
 
-        # 6. Evaluate — all 14 stats at T+1, key stats at T+2 and T+3
+        # 6. Evaluate all stats x all horizons
         year_metrics = {"year": test_year}
 
-        # All stats at T+1
-        eval_pairs = [(stat, 1) for stat in config["model"]["target_stats"]]
-        # Key stats at longer horizons
-        eval_pairs += [(stat, h) for stat in ["PTS", "REB", "AST", "MP"] for h in [2, 3]]
+        eval_pairs = [
+            (stat, h)
+            for stat in config["model"]["target_stats"]
+            for h in config["model"]["horizons"]
+        ]
 
         key_print_stats = {"PTS", "REB", "AST", "MP", "STL", "BLK", "TOV"}
         for stat, h in eval_pairs:
@@ -588,10 +611,12 @@ def run_training(save_artifacts=False, artifact_dir="artifacts"):
                 print(f"    {stat:>3s}: RMSE={avg_rmse:.2f}, "
                       f"Floor Cal={avg_floor:.1f}%, Ceil Cal={avg_ceil:.1f}%")
 
-        # Print longer-horizon summary for key stats
-        for h in [2, 3]:
+        # Print longer-horizon summary
+        for h in config["model"]["horizons"]:
+            if h == 1:
+                continue
             has_any = False
-            for stat in ["PTS", "REB", "AST", "MP"]:
+            for stat in config["model"]["target_stats"]:
                 rmse_col = f"{stat}_T+{h}_RMSE"
                 if rmse_col in metrics_df.columns:
                     if not has_any:

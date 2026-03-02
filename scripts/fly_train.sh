@@ -83,7 +83,7 @@ _download_logs() {
 _download_artifacts() {
     echo "Downloading artifacts from volume..."
 
-    # Get image ref from the deployed machine
+    # Get image ref from the deployed machine (or stopped machines)
     IMAGE_REF=$(fly machine list --app "$APP_NAME" --json 2>/dev/null | python3 -c "
 import json, sys
 machines = json.load(sys.stdin)
@@ -107,7 +107,7 @@ for v in vols:
 ")
 
     # Destroy stopped machines to free the volume
-    echo "  Freeing volume from stopped machine..."
+    echo "  Freeing volume from stopped machines..."
     fly machine list --app "$APP_NAME" --json 2>/dev/null | python3 -c "
 import json, sys
 machines = json.load(sys.stdin)
@@ -118,31 +118,65 @@ for m in machines:
     done
     sleep 5
 
-    # Spin up a cheap temp machine to access the volume
-    echo "  Starting temp machine to download artifacts..."
-    fly machine run "$IMAGE_REF" \
-        --app "$APP_NAME" \
-        --region "$REGION" \
-        --vm-size "shared-cpu-1x" \
-        --volume "${VOL_ID}:/output" \
-        --entrypoint "sleep 3600" \
-        --detach 2>&1
+    # Spin up a temp machine via the Machines API.
+    # NOTE: fly machine run --entrypoint "sleep 3600" does NOT work — Fly
+    # concatenates the entrypoint with the Dockerfile CMD, producing a broken
+    # command. We must use the API directly to set init.cmd=[] which clears
+    # the CMD and lets our entrypoint run alone.
+    echo "  Starting temp machine via Machines API..."
+    FLY_TOKEN=$(fly tokens create deploy --app "$APP_NAME" 2>/dev/null | grep "FlyV1" || fly auth token 2>/dev/null)
+    MACHINE_ID=$(curl -s -X POST "https://api.machines.dev/v1/apps/$APP_NAME/machines" \
+        -H "Authorization: Bearer $FLY_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"region\": \"$REGION\",
+            \"config\": {
+                \"image\": \"$IMAGE_REF\",
+                \"init\": {
+                    \"entrypoint\": [\"python3\", \"-c\", \"import time; time.sleep(3600)\"],
+                    \"cmd\": []
+                },
+                \"guest\": {\"cpu_kind\": \"shared\", \"cpus\": 1, \"memory_mb\": 256},
+                \"mounts\": [{\"volume\": \"$VOL_ID\", \"path\": \"/output\"}],
+                \"auto_destroy\": true
+            }
+        }" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 
-    echo "  Waiting for temp machine to start..."
-    sleep 15
+    echo "  Started machine $MACHINE_ID, waiting for it to boot..."
+    # Start and wait for running state
+    curl -s -X POST "https://api.machines.dev/v1/apps/$APP_NAME/machines/$MACHINE_ID/start" \
+        -H "Authorization: Bearer $FLY_TOKEN" > /dev/null 2>&1
+    sleep 10
 
-    # Download via ssh tar
+    # Download via ssh tar.
+    # fly ssh console prepends info text ("Only one machine available...")
+    # before the binary tar data, so we save the raw output and strip the
+    # preamble by finding the gzip magic bytes (0x1f 0x8b).
+    echo "  Downloading via SSH tar (this may take several minutes for large models)..."
     fly ssh console \
         --app "$APP_NAME" \
         --select \
         --command "tar czf - -C /output artifacts" \
-        > /tmp/dynasty_artifacts.tar.gz 2>/dev/null
+        > /tmp/dynasty_artifacts_raw.tar.gz 2>/dev/null
+
+    # Strip any text preamble before gzip magic bytes
+    python3 -c "
+with open('/tmp/dynasty_artifacts_raw.tar.gz', 'rb') as f:
+    data = f.read()
+idx = data.find(b'\x1f\x8b')
+if idx < 0:
+    raise RuntimeError('No gzip data found in download — SSH may have failed')
+if idx > 0:
+    print(f'  Stripped {idx} byte preamble from SSH output')
+with open('/tmp/dynasty_artifacts.tar.gz', 'wb') as f:
+    f.write(data[idx:])
+"
 
     # Extract locally
     mkdir -p "$LOCAL_ARTIFACT_DIR"
     tar xzf /tmp/dynasty_artifacts.tar.gz -C "$LOCAL_ARTIFACT_DIR" --strip-components=1 2>/dev/null || \
         tar xzf /tmp/dynasty_artifacts.tar.gz -C "$(dirname "$LOCAL_ARTIFACT_DIR")" 2>/dev/null
-    rm -f /tmp/dynasty_artifacts.tar.gz
+    rm -f /tmp/dynasty_artifacts_raw.tar.gz /tmp/dynasty_artifacts.tar.gz
 }
 
 _cleanup() {
