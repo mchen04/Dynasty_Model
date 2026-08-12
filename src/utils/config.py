@@ -6,7 +6,7 @@ _config_cache = None
 
 
 def get_project_root():
-    """Returns the project root directory (Dynasty_Model/)."""
+    """Returns the project root directory (nba-dynasty-model/)."""
     return Path(__file__).resolve().parent.parent.parent
 
 

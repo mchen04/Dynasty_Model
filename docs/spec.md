@@ -109,7 +109,7 @@ Pure math, no ML. Converts projections to dollars/trade values:
 ## Project Structure
 
 ```
-Dynasty_Model/
+nba-dynasty-model/
 ├── configs/
 │   └── config.yaml               # All paths, league defaults, hyperparameters
 ├── docs/
